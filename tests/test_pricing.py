@@ -88,11 +88,31 @@ class TestDecideType(unittest.TestCase):
 
 class TestCompute(unittest.TestCase):
     def _compute(self, row, **kwargs):
-        cr = CrawlResult(asin=row.asin)
+        cr = CrawlResult(asin=row.asin, marketplace=row.marketplace,
+                         currency_code='CAD' if row.marketplace == 'CA' else 'USD')
         for k, v in kwargs.items():
             setattr(cr, k, v)
         compute_result(row, cr, '0.50')
         return cr
+
+    def test_currency_us_and_ca_are_compared_in_their_own_currency(self):
+        us = self._compute(mk_row('49.99', target=Decimal('49.99')),
+                           display_price=Decimal('49.99'))
+        ca_row = mk_row('78.63', target=Decimal('78.63'))
+        ca_row.marketplace = 'CA'
+        ca = self._compute(ca_row, display_price=Decimal('78.63'))
+        self.assertEqual((us.currency_code, us.match), ('USD', '✅(0.00)'))
+        self.assertEqual((ca.currency_code, ca.match), ('CAD', '✅(0.00)'))
+
+    def test_unknown_or_cross_currency_blocks_comparison(self):
+        row = mk_row('49.99', target=Decimal('49.99'))
+        unknown = self._compute(row, display_price=Decimal('49.99'), currency_code='')
+        wrong = self._compute(row, display_price=Decimal('49.99'), currency_code='CAD')
+        for cr in (unknown, wrong):
+            self.assertEqual(cr.status, PageStatus.CURRENCY_ERROR)
+            self.assertEqual(cr.match, '-')
+            self.assertIsNone(cr.price_diff)
+            self.assertIn('currency_mismatch', cr.error)
 
     def test_original_adjustment(self):
         row = mk_row(normal='49.99', h='原价调整', i=Decimal('39.99'), target=Decimal('39.99'))

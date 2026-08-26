@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "single-file-cli": "2.1.3"
+  }
+}

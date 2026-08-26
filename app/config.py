@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""config.py — 配置加载与校验（默认值 → config.json → 环境变量）"""
+"""config.py — 配置加载与校验。
+
+非敏感配置：代码默认值 → config/config.json。
+敏感配置：项目根目录 .env → 系统环境变量（系统环境变量优先）。
+"""
 from __future__ import annotations
 
 import json
@@ -19,35 +23,59 @@ DEBUG_DIR = OUTPUT_DIR / 'debug'
 # 默认配置（代码兜底）
 DEFAULTS = {
     # 抓取
-    'workers': 2,                     # 固定 worker，初始 2，稳定后调 4
-    'delay_min': 1.0,
-    'delay_max': 4.0,
+    'workers': 4,                     # 正式全量：单浏览器四个独立 Tab
+    'post_archive_delay_min': 1.0,    # 商品完成后等待；价格/可选HTML共用，不重复等待
+    'post_archive_delay_max': 3.0,
+    'risk_cooldown_min': 60.0,
+    'risk_cooldown_max': 180.0,
     'page_timeout': 30,               # 整个页面加载超时(秒)
     'price_wait_timeout': 12,         # 等待价格元素出现(秒)
     'per_asin_timeout': 90,           # 单个 ASIN 总超时(秒)
     'retry': 2,                       # 技术失败重试次数
     'save_every': 10,                 # 每 N 条原子保存一次缓存
-    'us_zip': '90210',
+    'us_zip': '90210',                # 兼容旧配置名；语义为 US postal code
+    'ca_postal': 'M5V 3A8',
     'proxy': '',                      # 显式浏览器代理；留空使用固定 VPN，不自动读取系统代理
+    # HTML 归档（独立于代码产物，默认位于项目同级约定目录）
+    'html_archive_root': str(PROJECT_ROOT / 'htmls'),
+    'html_retention_days': 5,
+    'html_min_free_gb': 40.0,
+    'html_archive_required': True,
+    'html_archive_enabled': True,
+    'html_server_enabled': True,
+    'html_server_bind': '0.0.0.0',
+    'html_server_port': 8765,
+    'feishu_manager_open_id': '',
     # 计算
     'price_tolerance': '0.50',        # 一致性容差(USD, Decimal 字符串)
     'ambiguous_price_ratio': '0.05',  # 多候选冲突阈值
     # 缓存
     'cache_max_age_hours': 12,        # 缓存有效期
-    'parser_rule_version': '2026-08-21-v1',
+    'parser_rule_version': '2026-08-26-v4',
     # 飞书
     'feishu_source_wiki': 'https://wit0jhu6kvu.feishu.cn/wiki/O1t1wJVlHiEbd1kLdj6cIr0KnIg',
     'feishu_target_wiki': 'https://wit0jhu6kvu.feishu.cn/wiki/JbiQwDZXeiJan0k8ydRczfWNnFc',
+    'weekly_registry_url': 'https://wit0jhu6kvu.feishu.cn/wiki/HwxpwCnZ7iV1o5klIGbc8wJHnrd',
+    'weekly_registry_sheet_id': 'c1fcd1',  # 2026-08-24 R1.1 只读发现：Sheet1
+    'feishu_allowed_hosts': ['wit0jhu6kvu.feishu.cn'],
     'feishu_app_id': 'cli_aa097133e3355ccd',
-    'feishu_app_secret': '',          # 环境变量 FS_APP_SECRET 或 config.json
+    'feishu_app_secret': '',          # 仅由根目录 .env 或环境变量 FS_APP_SECRET 注入
     'feishu_output_start_col': 8,     # 紧凑目标表 H 列(1-based)
     'feishu_header_row': 2,           # 目标表表头固定第 2 行
     'feishu_output_headers': [
         '展示价格', '折扣类型', '折扣值', '最终价格', '一致性检查', '时间戳',
     ],
-    # 目标子表（默认美国站 11 表）
+    # R1.5 正式快照发现的全部业务子表（US 11 + CA 7）
     'sheets': ['PD03', 'PD17', 'PD05', 'PD25', 'XD03', 'XD17', 'PD52', 'PD39', 'PD33',
-               'PDF075', 'PD63'],
+               'PDF075', 'PD63', 'CPD03', 'CPD17', 'CPD05', 'CPD25', 'CPD39', 'CPD33',
+               'CPD52'],
+    'sheet_profiles': {
+        'PD03': 'US', 'PD17': 'US', 'PD05': 'US', 'PD25': 'US',
+        'XD03': 'US', 'XD17': 'US', 'PD52': 'US', 'PD39': 'US',
+        'PD33': 'US', 'PDF075': 'US', 'PD63': 'US',
+        'CPD03': 'CA', 'CPD17': 'CA', 'CPD05': 'CA', 'CPD25': 'CA',
+        'CPD39': 'CA', 'CPD33': 'CA', 'CPD52': 'CA',
+    },
     # 原始周报表列位置(1-based)
     'source_cols': {
         'asin': 1, 'sku': 2, 'size': 4, 'normal_price': 5,
@@ -67,8 +95,10 @@ DEFAULTS = {
 # 数值字段类型检查
 _NUM_FIELDS = {
     'workers': (int, 1, 16),
-    'delay_min': (float, 0, 60),
-    'delay_max': (float, 0, 120),
+    'post_archive_delay_min': (float, 0, 60),
+    'post_archive_delay_max': (float, 0, 120),
+    'risk_cooldown_min': (float, 1, 600),
+    'risk_cooldown_max': (float, 1, 900),
     'page_timeout': (float, 5, 180),
     'price_wait_timeout': (float, 1, 60),
     'per_asin_timeout': (float, 10, 600),
@@ -80,11 +110,13 @@ _NUM_FIELDS = {
     'max_error_ratio_for_push': (float, 0, 1),
     'max_target_fallback_ratio_for_push': (float, 0, 1),
     'log_keep': (int, 1, 365),
+    'html_retention_days': (int, 1, 30),
+    'html_min_free_gb': (float, 0, 10000),
 }
 
 
 def load_config(config_path: Path | None = None) -> dict:
-    """默认值 → config.json 覆盖 → 环境变量覆盖 Secret。启动即校验，错误直接抛。"""
+    """加载唯一职责配置源；启动即校验，错误直接抛。"""
     cfg = dict(DEFAULTS)
     path = Path(config_path) if config_path else PROJECT_ROOT / 'config' / 'config.json'
     if path.exists():
@@ -95,22 +127,42 @@ def load_config(config_path: Path | None = None) -> dict:
             raise RuntimeError(f'config.json 解析失败: {e}')
         if not isinstance(user, dict):
             raise RuntimeError('config.json 必须是 JSON 对象')
+        if 'feishu_app_secret' in user:
+            raise RuntimeError(
+                'config.json 禁止配置 feishu_app_secret；请使用项目根目录 .env '
+                '或系统环境变量 FS_APP_SECRET'
+            )
         cfg.update({k: v for k, v in user.items() if v is not None})
 
-    # 环境变量覆盖 Secret
-    env_secret = os.environ.get('FS_APP_SECRET', '').strip()
-    if env_secret:
-        cfg['feishu_app_secret'] = env_secret
-    elif not cfg.get('feishu_app_secret'):
-        envf = BASE_DIR / '.env'
-        if envf.exists():
+    # Secret 只允许来自根目录 .env 或系统环境变量；系统环境变量优先。
+    envf = PROJECT_ROOT / '.env'
+    file_secret = ''
+    if envf.is_file():
+        try:
+            for line in envf.read_text(encoding='utf-8').splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                if stripped.startswith('FS_APP_SECRET='):
+                    file_secret = stripped.split('=', 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    elif envf.is_dir():
+        # 兼容该项目既有的本地凭证目录；不扫描目录，也不接受多个候选文件。
+        legacy = envf / '飞书凭证.txt'
+        if legacy.is_file():
             try:
-                for line in envf.read_text(encoding='utf-8').splitlines():
-                    if line.startswith('FS_APP_SECRET='):
-                        cfg['feishu_app_secret'] = line.split('=', 1)[1].strip()
-                        break
-            except OSError:
-                pass
+                lines = [line.strip() for line in legacy.read_text(encoding='utf-8').splitlines()
+                         if line.strip()]
+            except OSError as exc:
+                raise RuntimeError(f'无法读取本地飞书凭证文件: {exc}') from exc
+            if len(lines) != 2:
+                raise RuntimeError('本地飞书凭证文件必须恰好包含 App ID 和 Secret 两个非空行')
+            if lines[0] != str(cfg.get('feishu_app_id') or ''):
+                raise RuntimeError('本地飞书凭证 App ID 与 config.json 不一致，禁止混用')
+            file_secret = lines[1]
+    cfg['feishu_app_secret'] = os.environ.get('FS_APP_SECRET', '').strip() or file_secret
 
     validate(cfg)
     return cfg
@@ -141,20 +193,37 @@ def validate(cfg: dict) -> None:
     from decimal import Decimal, InvalidOperation
     for key in ('price_tolerance', 'ambiguous_price_ratio'):
         try:
-            Decimal(str(cfg[key]))
+            number = Decimal(str(cfg[key]))
+            if not number.is_finite() or number < 0:
+                raise RuntimeError(f'配置项 {key} 必须是有限非负数')
         except InvalidOperation:
             raise RuntimeError(f'配置项 {key} 不是合法的小数: {cfg[key]!r}')
 
-    if cfg['delay_max'] < cfg['delay_min']:
-        raise RuntimeError('delay_max 不能小于 delay_min')
+    if cfg['post_archive_delay_max'] < cfg['post_archive_delay_min']:
+        raise RuntimeError('post_archive_delay_max 不能小于 post_archive_delay_min')
+    if cfg['risk_cooldown_max'] < cfg['risk_cooldown_min']:
+        raise RuntimeError('risk_cooldown_max 不能小于 risk_cooldown_min')
     if cfg['per_asin_timeout'] < cfg['page_timeout']:
         raise RuntimeError('per_asin_timeout 不能小于 page_timeout')
     if not cfg['feishu_app_id']:
         raise RuntimeError('feishu_app_id 不能为空')
+    if not isinstance(cfg.get('feishu_allowed_hosts'), list) or not cfg['feishu_allowed_hosts']:
+        raise RuntimeError('feishu_allowed_hosts 必须是非空数组')
+    profiles = cfg.get('sheet_profiles')
+    if not isinstance(profiles, dict) or set(profiles) != set(cfg.get('sheets') or []):
+        raise RuntimeError('sheet_profiles 必须与 sheets 一一对应')
+    if any(value not in ('US', 'CA') for value in profiles.values()):
+        raise RuntimeError('sheet_profiles Marketplace 只允许 US 或 CA')
+    from weekly_registry import validate_feishu_resource_url
+    validate_feishu_resource_url(cfg['weekly_registry_url'], cfg['feishu_allowed_hosts'])
     if cfg['feishu_output_start_col'] < 1:
         raise RuntimeError('feishu_output_start_col 必须 >= 1')
     if len(cfg['feishu_output_headers']) != 6:
         raise RuntimeError('feishu_output_headers 必须正好 6 列')
+    if not isinstance(cfg.get('html_archive_root'), str) or not cfg['html_archive_root'].strip():
+        raise RuntimeError('html_archive_root 必须是非空路径')
+    if not isinstance(cfg.get('html_archive_required'), bool):
+        raise RuntimeError('html_archive_required 必须是布尔值')
 
 
 def ensure_dirs() -> None:

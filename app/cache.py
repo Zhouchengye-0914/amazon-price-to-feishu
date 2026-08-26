@@ -12,8 +12,35 @@ from pathlib import Path
 
 from config import SNAPSHOT_DIR, CACHE_ROOT
 from models import CrawlResult, PageStatus, ReportRow
+from runtime_state import atomic_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5  # invalidates results captured without region/price-evidence checks
+
+def validate_recovery_metadata(meta, cfg):
+    """Do not publish stale calculations after a parser or tolerance change."""
+    if meta.get('parser_rule_version') != cfg.get('parser_rule_version'):
+        raise RuntimeError('恢复数据解析规则版本不一致，请重新抓取')
+    if str(meta.get('price_tolerance')) != str(cfg.get('price_tolerance')):
+        raise RuntimeError('恢复数据价格容差不一致，请重新抓取')
+    try:
+        created = datetime.fromisoformat(meta['created_at'])
+        age = (datetime.now(created.tzinfo) - created).total_seconds() / 3600
+        if not 0 <= age <= float(cfg['cache_max_age_hours']):
+            raise ValueError('expired')
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError('恢复数据已过期或时间无效，请重新抓取') from exc
+
+def validate_record_ages(records, cfg):
+    for record in records:
+        if record.get('status') not in ('ok', 'sold_out', 'page_not_found'):
+            continue
+        try:
+            captured = datetime.fromisoformat(record['timestamp'])
+            hours = (datetime.now(captured.tzinfo) - captured).total_seconds() / 3600
+            if not 0 <= hours <= float(cfg['cache_max_age_hours']):
+                raise ValueError('expired')
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError('商品采集时间过期或无效，不能通过重存缓存续期') from exc
 
 
 def make_run_id() -> str:
@@ -25,7 +52,7 @@ def data_signature(rows: list[ReportRow]) -> str:
     h = hashlib.sha256()
     for r in rows:
         h.update(f'{r.asin}|{r.sku}|{r.size}|{r.normal_price}|{r.h_type}|'
-                 f'{r.i_value}|{r.target_price};'.encode())
+                 f'{r.i_value}|{r.target_price}|{r.marketplace}|{r.product_url};'.encode())
     return h.hexdigest()[:16]
 
 
@@ -64,11 +91,7 @@ def load_latest_snapshot() -> tuple[str, dict] | None:
 
 # ---------------- 抓取缓存 ----------------
 def _atomic_write(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
-    with io.open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)          # 原子替换，断电不会留下半个 JSON
+    atomic_json(path, data)
 
 
 def cache_dir(run_id: str) -> Path:
@@ -85,6 +108,10 @@ def save_sheet_cache(run_id: str, sheet: str, rows: list[ReportRow],
         'sheet': sheet,
         'asin_signature': data_signature(rows),
         'price_tolerance': str(cfg['price_tolerance']),
+        'marketplaces': sorted({r.marketplace for r in rows if r.marketplace}),
+        'currency_codes': sorted({c.currency_code for c in crawls if c.currency_code}),
+        'html_archive_enabled': bool(cfg.get('html_archive_enabled', True)),
+        'html_archive_required': bool(cfg.get('html_archive_required', True)),
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'records': {c.asin: c.as_dict() for c in crawls},
     }
@@ -117,12 +144,28 @@ def is_cache_valid(meta: dict | None, cfg: dict, sheet: str,
         return False
     if str(meta.get('price_tolerance')) != str(cfg['price_tolerance']):
         return False
+    if sorted(meta.get('marketplaces') or []) != sorted({r.marketplace for r in rows if r.marketplace}):
+        return False
+    archive_enabled = bool(cfg.get('html_archive_enabled', True))
+    if bool(meta.get('html_archive_enabled')) != archive_enabled:
+        return False
+    if archive_enabled:
+        for record in (meta.get('records') or {}).values():
+            if record.get('status') not in ('ok', 'page_not_found', 'sold_out'):
+                continue
+            path = Path(str(record.get('html_path') or ''))
+            if record.get('archive_status') != 'ok' or not path.is_file():
+                return False
     try:
         created = datetime.fromisoformat(meta['created_at'])
         age_h = (datetime.now() - created).total_seconds() / 3600
     except Exception:
         return False
-    if age_h > cfg['cache_max_age_hours']:
+    if not 0 <= age_h <= cfg['cache_max_age_hours']:
+        return False
+    try:
+        validate_record_ages((meta.get('records') or {}).values(), cfg)
+    except RuntimeError:
         return False
     return True
 
@@ -133,6 +176,7 @@ def _crawl_from_dict(d: dict) -> CrawlResult | None:
     if not d:
         return None
     cr = CrawlResult(asin=d.get('asin') or '')
+    cr.run_id = d.get('run_id') or ''
     try:
         cr.status = PageStatus(d.get('status') or 'ok')
     except ValueError:
@@ -167,6 +211,22 @@ def _crawl_from_dict(d: dict) -> CrawlResult | None:
     cr.attempt_count = int(d.get('attempt_count') or 0)
     cr.page_url = d.get('page_url') or ''
     cr.page_title = d.get('page_title') or ''
+    cr.duration_ms = int(d.get('duration_ms') or 0)
+    cr.marketplace = d.get('marketplace') or ''
+    cr.currency_code = (d.get('currency_code') or '').upper()
+    cr.product_url = d.get('product_url') or ''
+    cr.location_verified = bool(d.get('location_verified'))
+    cr.risk_cooldown_seconds = float(d.get('risk_cooldown_seconds') or 0)
+    cr.html_path = d.get('html_path') or ''
+    cr.html_url = d.get('html_url') or ''
+    cr.html_sha256 = d.get('html_sha256') or ''
+    cr.html_size_bytes = int(d.get('html_size_bytes') or 0)
+    cr.archive_ms = int(d.get('archive_ms') or 0)
+    cr.archive_status = d.get('archive_status') or ''
+    cr.archive_error = d.get('archive_error') or ''
+    cr.post_archive_delay_seconds = float(d.get('post_archive_delay_seconds') or 0)
+    cr.stripped_noncore_css_resources = int(
+        d.get('stripped_noncore_css_resources') or 0)
     return cr
 
 

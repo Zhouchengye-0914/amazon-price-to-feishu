@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-RULE_VERSION = '2026-08-21-v1'
+RULE_VERSION = '2026-08-25-v2'
 
 # ---- 主价格候选（按优先级） ----
 MAIN_PRICE_CANDIDATES = [

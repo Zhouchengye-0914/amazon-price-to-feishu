@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""parser.py — Amazon HTML 解析（正则 + 锚点，纯函数无 IO，可单测）
+"""parser.py — Amazon DOM控件内解析（纯函数无 IO，可单测）
 
 主价多候选、Save/Code/Coupon 分层读取；全部返回原始文本 + 解析值 + 命中规则。
 """
@@ -9,26 +9,17 @@ import re
 from decimal import Decimal
 
 from models import PriceCandidate
+from amazon.price_evidence import main_segments, promotion_segments, Tree
 from pricing import parse_price_text, parse_pct_text
 from amazon.selectors import (
-    CODE_TEXT_PATTERNS, COUPON_AMOUNT_PATTERNS, COUPON_HTML_PATTERNS,
-    MAIN_PRICE_CANDIDATES, SAVE_SELECTORS,
+    CODE_TEXT_PATTERNS, COUPON_AMOUNT_PATTERNS, COUPON_ELEM_HINTS, COUPON_HTML_PATTERNS,
+    SAVE_SELECTORS,
 )
 
 
 def _compact(html: str) -> str:
     """压缩标签间空白，让跨行正则可靠"""
-    return re.sub(r'>\s+<', '><', html or '')
-
-
-def _segment(html: str, patterns: list[str], length: int = 1200) -> str | None:
-    """找到第一个锚点，返回其后 length 字符片段"""
-    html = _compact(html)
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return html[m.start():m.start() + length]
-    return None
+    return html if isinstance(html, Tree) else re.sub(r'>\s+<', '><', html or '')
 
 
 def _price_from_segment(seg: str) -> tuple[Decimal | None, str]:
@@ -62,55 +53,18 @@ def _price_from_segment(seg: str) -> tuple[Decimal | None, str]:
     return None, ''
 
 
-def _container(html: str, open_pat: str, length: int) -> str | None:
-    """按容器锚点提取片段（优先容器语义）"""
-    m = re.search(open_pat, html)
-    if m:
-        return html[m.start():m.start() + length]
-    return None
-
-
 def parse_main_price(html: str) -> list[PriceCandidate]:
     """按容器语义收集主价候选（不去重，调用方做冲突判断）。"""
     html = _compact(html)
     cands: list[PriceCandidate] = []
 
-    # 1. #corePrice_feature_div 主价格容器（最权威）
-    seg = _container(html, r'id="corePrice_feature_div"', 5000)
-    if seg:
+    for rule, seg in main_segments(html):
         v, raw = _price_from_segment(seg)
-        cands.append(PriceCandidate(rule='corePrice', raw_text=raw, value=v))
-
-    # 2. Price to Pay 元素
-    seg = _segment(html, [r'class="[^"]*priceToPay[^"]*"', r'apex-pricetopay-value'], 1500)
-    if seg:
-        v, raw = _price_from_segment(seg)
-        cands.append(PriceCandidate(rule='priceToPay', raw_text=raw, value=v))
-
-    # 3. Buy Box
-    seg = _container(html, r'id="buybox"', 5000)
-    if seg:
-        v, raw = _price_from_segment(seg)
-        cands.append(PriceCandidate(rule='buybox', raw_text=raw, value=v))
-
-    # 4. 全局 whole/fraction 兜底（只在前面都没拿到时）
-    if not any(c.value is not None for c in cands):
-        m = re.search(r'a-price-whole">\s*([\d,]+).{0,300}?a-price-fraction">\s*(\d+)', html)
-        if m:
-            raw = f'{m.group(1)}.{m.group(2)}'
-            cands.append(PriceCandidate(
-                rule='whole_fraction',
-                raw_text=raw,
-                value=Decimal(m.group(1).replace(',', '') + '.' + m.group(2)),
-            ))
-
-    # 5. 全局第一个 a-offscreen 兜底
-    if not any(c.value is not None for c in cands):
-        m = re.search(r'a-offscreen">\s*([^<]+?)\s*<', html)
-        if m:
-            raw = m.group(1).strip()
-            v = parse_price_text(raw)
-            cands.append(PriceCandidate(rule='global_offscreen', raw_text=raw, value=v))
+        if not re.search(r'[$€£¥]|USD|CAD', raw, re.I):
+            symbol = re.search(r'a-price-symbol[^>]*>([^<]+)', seg)
+            if symbol:
+                raw = symbol.group(1).strip() + raw
+        cands.append(PriceCandidate(rule=rule, raw_text=raw, value=v))
 
     return cands
 
@@ -138,72 +92,66 @@ def select_main_price(cands: list[PriceCandidate], ambiguous_ratio: str) -> tupl
 
 def _save_in_segment(seg: str) -> tuple[Decimal | None, str]:
     """在限定片段内找 Save% 折扣（只认主价格容器，避免推荐商品/动态区域误抓）"""
-    for cls in SAVE_SELECTORS:
-        m = re.search(rf'class="[^"]*{re.escape(cls.lstrip("."))}[^"]*"[^>]*>\s*([+-]?\s*[\d.]+\s*%)', seg)
-        if m:
-            raw = m.group(1).strip()
-            pct = parse_pct_text(raw)
-            if pct is not None:
-                return pct, raw
-    return None, ''
+    matches = [m.group(1).strip() for cls in SAVE_SELECTORS
+               for m in re.finditer(rf'class="[^"]*{re.escape(cls.lstrip("."))}[^"]*"[^>]*>\s*([+-]?\s*[\d.]+\s*%)', seg)]
+    pct = _unique([parse_pct_text(raw) for raw in matches], 'Save控件')
+    return pct, ' | '.join(dict.fromkeys(matches))
 
 
-def parse_save(html: str) -> tuple[Decimal | None, str]:
-    """价格折扣：只读主价格区域的 Save 百分比（corePrice 容器 → priceToPay 前后窗口）。
-    严禁全局搜索——推荐商品区/JS 动态区域的 -X% 会误判；多变体页无 corePrice 容器时用 priceToPay 窗口兜底。"""
-    html = _compact(html)
-    # 1. 主价格容器 #corePrice_feature_div
-    seg = _container(html, r'id="corePrice_feature_div"', 5000)
-    if seg:
-        pct, raw = _save_in_segment(seg)
-        if pct is not None:
-            return pct, raw
-    # 2. priceToPay 锚点前后窗口（savings 通常在 priceToPay 上方）
-    #    优先 class 里的 priceToPay（真主价区）；apex-pricetopay-value 可能在变体/其他区，仅兜底
-    m = re.search(r'class="[^"]*priceToPay[^"]*"', html) or re.search(r'apex-pricetopay-value', html)
-    if m:
-        win = html[max(0, m.start() - 3000): m.start() + 1500]
-        pct, raw = _save_in_segment(win)
-        if pct is not None:
-            return pct, raw
-    return None, ''
-
-
-def parse_code(html: str) -> tuple[Decimal | None, str]:
+def _parse_code_segment(html: str) -> tuple[Decimal | None, str]:
     """Code：返回 (code_pct, 原始文本)。只认促销文案，禁止反推。"""
     html = _compact(html)
-    for pat in CODE_TEXT_PATTERNS:
-        m = re.search(pat, html)
-        if m:
-            raw = m.group(0).strip()
-            pct = parse_pct_text(raw)
-            if pct is not None:
-                return pct, raw
-    return None, ''
+    matches = [(parse_pct_text(m.group(0)), m.group(0).strip())
+               for pat in CODE_TEXT_PATTERNS for m in re.finditer(pat, html, re.I)]
+    pct = _unique([item[0] for item in matches], 'Code控件')
+    return pct, ' | '.join(dict.fromkeys(item[1] for item in matches))
 
 
-def parse_coupon(html: str) -> tuple[Decimal | None, Decimal | None, str]:
+def _parse_coupon_segment(html: str) -> tuple[Decimal | None, Decimal | None, str]:
     """Coupon：返回 (coupon_pct, coupon_amount, 原始文本)。final 由 DOM 流程补充。"""
     html = _compact(html)
+    _unique([Decimal(m.group(1)) for pat in COUPON_HTML_PATTERNS
+             for m in re.finditer(pat, html, re.I) if '%' in m.group(0)], 'Coupon比例')
     raw_parts: list[str] = []
     pct = None
     amount = None
 
+    evidence_span: tuple[int, int] | None = None
     for pat in COUPON_HTML_PATTERNS:
-        m = re.search(pat, html)
-        if m:
+        for m in re.finditer(pat, html, re.IGNORECASE):
+            context = html[max(0, m.start() - 700):m.end() + 700].lower()
+            # aria-label="X% off coupon applied" 本身就是结构化证据；其他较宽松
+            # 文案必须位于 Amazon Coupon 控件内。这样不会把评论中的 coupon
+            # 经历、推荐商品优惠或脚本模板误认为当前 ASIN 的优惠。
+            structured = 'aria-label=' in m.group(0).lower()
+            anchored = any(h.lower() in context for h in COUPON_ELEM_HINTS) or any(
+                h in context for h in ('couponsinbuybox', 'promotioncc', 'newcouponbadge')
+            )
+            if not (structured or anchored):
+                continue
             raw_parts.append(m.group(0).strip())
             v = Decimal(m.group(1))
             if '%' in m.group(0):
                 pct = (v / 100) if pct is None else pct
             else:
                 amount = v if amount is None else amount
+            evidence_span = (m.start(), m.end())
+            break
+        if evidence_span is not None:
             break
 
     # 金额：Saving $15.00 / Save $X with coupon（金额必须 > 0，过滤隐藏字段 value="0"）
-    if pct is not None or amount is not None:
-        for pat in COUPON_AMOUNT_PATTERNS:
-            m = re.search(pat, html)
+    if evidence_span is not None:
+        # Saving 金额必须来自同一个 Coupon 控件，禁止再扫描整页。评论区和
+        # “Frequently bought together” 中也经常出现 Saving/$X 文案。
+        start, end = evidence_span
+        coupon_scope = html  # already bounded to one eligible DOM control
+        patterns = [r'Saving.{0,300}?\$\s*([0-9]+(?:\.[0-9]+)?)',
+                    *COUPON_AMOUNT_PATTERNS[1:]]
+        _unique([Decimal(m.group(1)) for pat in patterns
+                 for m in re.finditer(pat, coupon_scope, re.I) if Decimal(m.group(1)) > 0], 'Coupon金额')
+        for pat in patterns:
+            m = re.search(pat, coupon_scope, re.IGNORECASE)
             if m:
                 v = Decimal(m.group(1))
                 if v > 0:
@@ -214,6 +162,34 @@ def parse_coupon(html: str) -> tuple[Decimal | None, Decimal | None, str]:
     raw = ' | '.join(dict.fromkeys(raw_parts))[:300]
     return pct, amount, raw
 
+
+class PromotionEvidenceError(ValueError):
+    pass
+
+def _unique(items, name):
+    present = {item for item in items if item is not None}
+    if len(present) > 1:
+        raise PromotionEvidenceError(f'{name}存在互相冲突的促销证据: {sorted(present)}')
+    return next(iter(present), None)
+
+def parse_save(html):
+    values = [_save_in_segment(seg) for _, seg in main_segments(html)]
+    pct = _unique([v[0] for v in values], 'Save')
+    return pct, ' | '.join(dict.fromkeys(v[1] for v in values if v[1]))
+
+def parse_code(html):
+    values = [_parse_code_segment(seg) for seg in promotion_segments(html, 'code')]
+    pct = _unique([v[0] for v in values], 'Code')
+    return pct, ' | '.join(dict.fromkeys(v[1] for v in values if v[1]))
+
+def parse_coupon(html):
+    values = [_parse_coupon_segment(seg) for seg in promotion_segments(html, 'coupon')]
+    # Do not merge a percentage from one offer with an amount from another.
+    offers = {(pct, amount) for pct, amount, _ in values if pct is not None or amount is not None}
+    if len(offers) > 1:
+        raise PromotionEvidenceError('Coupon控件存在不同优惠，禁止跨控件拼接')
+    pct, amount = next(iter(offers), (None, None))
+    return pct, amount, ' | '.join(dict.fromkeys(v[2] for v in values if v[2]))[:300]
 
 def collect_promotion_raw(html: str) -> str:
     """汇总 coupon/code/save 的原始证据文本（截断 500 字符）"""

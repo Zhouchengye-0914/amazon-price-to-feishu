@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 import time
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from models import (
     TARGET_SOURCE_FEISHU, TARGET_SOURCE_MISSING,
 )
 from pricing import calc_target_price, dec
+from weekly_registry import parse_registry_values
 
 FEISHU_BASE = 'https://open.feishu.cn/open-apis'
 # 旧版追加列表头（迁移时清理）
@@ -130,9 +133,10 @@ def col_letter(n: int) -> str:
 
 def _detect_header_row(vals: list[list]) -> int:
     """在前几行里找含 'ASIN' 的表头行（0-based），找不到返回 -1"""
-    for i, row in enumerate(vals[:6]):
-        for cell in row[:15]:
-            if isinstance(cell, str) and cell.strip() == 'ASIN':
+    from weekly_mapping import cell_text
+    for i, row in enumerate(vals[:10]):
+        for cell in row:
+            if cell_text(cell).upper() == 'ASIN':
                 return i
     return -1
 
@@ -140,12 +144,11 @@ def _detect_header_row(vals: list[list]) -> int:
 def _resolve_cols(header_row: list, cfg: dict) -> dict:
     """按表头名定位列（1-based），找不到的字段用 config.source_cols 兜底"""
     cols = dict(cfg['source_cols'])
-    for i, cell in enumerate(header_row[:15]):
-        if not isinstance(cell, str):
-            continue
-        s = cell.strip()
+    from weekly_mapping import cell_text
+    for i, cell in enumerate(header_row):
+        s = cell_text(cell)
         for key, name in _COL_NAME_MAP.items():
-            if s == name:
+            if s.casefold() == name.casefold():
                 cols[key] = i + 1
     return cols
 
@@ -169,7 +172,13 @@ def read_source_rows(vals: list[list], cfg: dict,
         asin_v = _cell(cols['asin'])
         asin = str(asin_v).strip() if asin_v is not None else ''
         if not asin.startswith('B0'):
-            continue
+            from product_links import normalize_product, ProductLinkError
+            try:
+                asin, _ = normalize_product(asin_v, cfg.get('source_marketplace', 'US'))
+            except ProductLinkError as exc:
+                if 'http' in str(asin_v).lower():
+                    raise RuntimeError(f'源行{idx}商品链接无效: {exc}') from exc
+                continue
         rr = ReportRow(
             row_num=idx, asin=asin,
             sku=str(_cell(cols['sku']) or '').strip(),
@@ -189,6 +198,9 @@ def read_source_rows(vals: list[list], cfg: dict,
             rr.target_price_source = (TARGET_SOURCE_FALLBACK if rr.target_price is not None
                                       else TARGET_SOURCE_MISSING)
         missing = []
+        for name, value in (('目标成交价', rr.target_price), ('正常售价', rr.normal_price)):
+            if value is not None and (not value.is_finite() or value < 0):
+                missing.append(f'{name}必须是有限非负数')
         if rr.target_price is None:
             missing.append('目标成交价(K)')
         if rr.normal_price is None:
@@ -285,6 +297,96 @@ class FeishuClient:
         obj, _ = self.resolve_wiki_obj(wiki_url)
         return obj
 
+    def ensure_permission_member(self, file_token: str, file_type: str,
+                                 member_id: str, member_type: str = 'openid',
+                                 perm: str = 'full_access') -> dict:
+        """幂等确保指定成员拥有云文档权限。"""
+        if not file_token or not member_id:
+            raise RuntimeError('云文档授权缺少 file_token 或 member_id')
+        r = self._client.get(
+            f'/drive/v1/permissions/{file_token}/members',
+            params={'type': file_type, 'page_size': 100}, headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"读取云文档协作者失败: {data.get('msg')}")
+        for item in (data.get('data') or {}).get('items') or []:
+            if (item.get('member_id') == member_id
+                    and item.get('member_type') == member_type
+                    and item.get('perm') == perm):
+                return {'member_id': member_id, 'member_type': member_type,
+                        'perm': perm, 'reused': True}
+        r = self._client.post(
+            f'/drive/v1/permissions/{file_token}/members',
+            params={'type': file_type, 'need_notification': 'true'},
+            json={'member_type': member_type, 'member_id': member_id, 'perm': perm},
+            headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"添加云文档管理协作者失败: {data.get('msg')}")
+        return {'member_id': member_id, 'member_type': member_type,
+                'perm': perm, 'reused': False}
+
+    def send_text_message(self, open_id: str, text: str) -> str:
+        """向指定用户发送任务完成通知，并返回 message_id。"""
+        if not open_id or not text.strip():
+            raise RuntimeError('飞书通知缺少 open_id 或消息正文')
+        r = self._client.post(
+            '/im/v1/messages', params={'receive_id_type': 'open_id'},
+            json={'receive_id': open_id, 'msg_type': 'text',
+                  'content': json.dumps({'text': text}, ensure_ascii=False)},
+            headers=self._headers())
+        data = r.json()
+        if r.is_error:
+            raise RuntimeError(f"飞书消息失败: HTTP {r.status_code}, code={data.get('code')}, {data.get('msg')}")
+        if data.get('code') != 0:
+            raise RuntimeError(f"飞书完成通知失败: {data.get('msg')}")
+        message_id = ((data.get('data') or {}).get('message_id') or '')
+        if not message_id:
+            raise RuntimeError('飞书完成通知未返回 message_id')
+        return message_id
+
+    def send_post_message(self, open_id: str, post: dict) -> str:
+        """Send a rich-text completion with explicit named links."""
+        if not open_id or not post:
+            raise RuntimeError('飞书通知缺少 open_id 或消息正文')
+        r = self._client.post(
+            '/im/v1/messages', params={'receive_id_type': 'open_id'},
+            json={'receive_id': open_id, 'msg_type': 'post',
+                  'content': json.dumps(post, ensure_ascii=False)},
+            headers=self._headers())
+        data = r.json()
+        if r.is_error or data.get('code') != 0:
+            raise RuntimeError(f"飞书消息失败: HTTP {r.status_code}, code={data.get('code')}, {data.get('msg')}")
+        message_id = (data.get('data') or {}).get('message_id')
+        if not message_id:
+            raise RuntimeError('飞书完成通知未返回 message_id')
+        return message_id
+
+    def application_collaborators(self) -> list[str]:
+        """Application developer collaborators, not document sharing members."""
+        r = self._client.get(
+            f'/application/v6/applications/{self.cfg["feishu_app_id"]}/collaborators',
+            params={'user_id_type': 'open_id'}, headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"读取应用协作者失败: {data.get('msg')}")
+        ids = [item['user_id'] for item in (data.get('data') or {}).get('collaborators', [])
+               if item.get('user_id')]
+        if not ids or any(not item.startswith('ou_') for item in ids):
+            raise RuntimeError('应用协作者列表为空或不是Open ID，禁止误发')
+        return list(dict.fromkeys(ids))
+
+    def rename_spreadsheet(self, token: str, title: str) -> None:
+        r = self._client.patch(f'/sheets/v3/spreadsheets/{token}',
+                               json={'title': title}, headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        if data.get('code') != 0:
+            raise RuntimeError(f"更新结果表名称失败: {data.get('msg')}")
+
     # ---------- 上传文件（原始表为 xlsx file 时） ----------
     def read_source_file(self, file_token: str, sheets: list[str],
                          cfg: dict) -> tuple[dict[str, list[ReportRow]], dict, list[dict]]:
@@ -345,6 +447,213 @@ class FeishuClient:
             raise RuntimeError(f"sheet 列表失败: {d.get('msg')}")
         return {s.get('title'): s.get('sheet_id')
                 for s in ((d.get('data') or {}).get('sheets') or []) if s.get('sheet_id')}
+
+    def query_sheets(self, spreadsheet: str) -> list[dict]:
+        """读取完整子表元数据；大表 v3 超时/5xx 时回退 v2 metainfo。"""
+        try:
+            r = self._client.get(
+                f'/sheets/v3/spreadsheets/{spreadsheet}/sheets/query',
+                headers=self._headers(), timeout=8)
+            if r.status_code < 500:
+                r.raise_for_status()
+                d = r.json()
+                if d.get('code') != 0:
+                    raise RuntimeError(f"sheet 列表失败: {d.get('msg')}")
+                sheets = ((d.get('data') or {}).get('sheets') or [])
+                if any(not (s.get('grid_properties') or {}).get('row_count') for s in sheets):
+                    raise RuntimeError('子表元数据缺少行容量，禁止按固定2000行截断')
+                return sheets
+        except httpx.TransportError:
+            pass
+
+        r = self._client.get(f'/sheets/v2/spreadsheets/{spreadsheet}/metainfo',
+                             headers=self._headers(), timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') != 0:
+            raise RuntimeError(f"sheet 元数据读取失败: {d.get('msg')}")
+        normalized = []
+        for sheet in ((d.get('data') or {}).get('sheets') or []):
+            normalized.append({
+                'sheet_id': sheet.get('sheetId') or sheet.get('sheet_id'),
+                'title': sheet.get('title') or '',
+                'index': sheet.get('index'),
+                'grid_properties': {
+                    'row_count': sheet.get('rowCount') or sheet.get('row_count'),
+                    'column_count': sheet.get('columnCount') or sheet.get('column_count'),
+                },
+            })
+        if any(not s['grid_properties'].get('row_count') for s in normalized):
+            raise RuntimeError('子表元数据缺少行容量，禁止按固定2000行截断')
+        return normalized
+
+    def spreadsheet_structure(self, spreadsheet: str) -> dict:
+        """生成可重复的结构摘要；按Sheet ID逐表读取A1:P10。"""
+        sheets = self.query_sheets(spreadsheet)
+        # Do not depend on batch range prefixes being IDs rather than titles.
+        samples = {s['sheet_id']: self.read_values(spreadsheet, s['sheet_id'], 'A1:P10')
+                   for s in sheets if s.get('sheet_id')}
+        result = []
+        for sheet in sheets:
+            sheet_id = sheet.get('sheet_id') or ''
+            if not sheet_id:
+                continue
+            grid = sheet.get('grid_properties') or {}
+            result.append({
+                'title': sheet.get('title') or '',
+                'index': sheet.get('index'),
+                'row_count': grid.get('row_count'),
+                'column_count': grid.get('column_count'),
+                'sample': samples.get(sheet_id, []),
+            })
+        canonical = json.dumps(result, ensure_ascii=False, sort_keys=True,
+                               separators=(',', ':'), default=str)
+        return {
+            'sheet_count': len(result),
+            'sheets': result,
+            'sha256': hashlib.sha256(canonical.encode('utf-8')).hexdigest(),
+        }
+
+    def read_values_batch(self, spreadsheet: str, ranges: list[str]) -> dict[str, list]:
+        """分批读取多个 range，返回 {sheet_id: values}。"""
+        result = {}
+        for start in range(0, len(ranges), 10):
+            chunk = ranges[start:start + 10]
+            params = [('ranges', item) for item in chunk]
+            r = self._client.get(
+                f'/sheets/v2/spreadsheets/{spreadsheet}/values_batch_get',
+                params=params, headers=self._headers())
+            r.raise_for_status()
+            d = r.json()
+            if d.get('code') != 0:
+                raise RuntimeError(f"批量读取失败: {d.get('msg')}")
+            for item in ((d.get('data') or {}).get('valueRanges') or []):
+                value_range = item.get('valueRange') or item
+                full_range = str(value_range.get('range') or '')
+                sheet_id = full_range.split('!', 1)[0]
+                values = value_range.get('values') or []
+                if sheet_id:
+                    result[sheet_id] = values
+        return result
+
+    def copy_file(self, file_token: str, file_type: str, name: str,
+                  folder_token: str = '') -> dict:
+        """复制云文档到指定 Drive 目录；空 folder_token 表示应用根目录。"""
+        body = {'name': name, 'type': file_type, 'folder_token': folder_token}
+        r = self._client.post(f'/drive/v1/files/{file_token}/copy',
+                              json=body, headers=self._headers())
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') != 0:
+            raise RuntimeError(f"创建飞书副本失败: {d.get('msg')} (code={d.get('code')})")
+        file_info = (d.get('data') or {}).get('file') or {}
+        token = file_info.get('token') or ''
+        if not token:
+            raise RuntimeError('创建飞书副本成功但响应缺少副本 Token')
+        return file_info
+
+    def list_root_files(self, page_size: int = 50) -> list[dict]:
+        """只读列出应用 Drive 根目录最近文件，用于找回已创建的 TEST PoC。"""
+        r = self._client.get('/drive/v1/files', params={
+            'page_size': page_size, 'order_by': 'CreatedTime', 'direction': 'DESC',
+        }, headers=self._headers())
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') != 0:
+            raise RuntimeError(f"读取 Drive 根目录失败: {d.get('msg')}")
+        return ((d.get('data') or {}).get('files') or [])
+
+    def wait_spreadsheet_structure(self, spreadsheet: str,
+                                   attempts: int = 5) -> dict:
+        """等待刚复制的 Spreadsheet 可读；只重试暂时性服务端/传输错误。"""
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                return self.spreadsheet_structure(spreadsheet)
+            except (RuntimeError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(2 + attempt * 2)
+        raise RuntimeError(f'副本在有限轮询后仍不可读: {last_error}')
+
+    def create_spreadsheet(self, title: str, folder_token: str = '') -> dict:
+        """在 Drive 中创建独立 Spreadsheet。"""
+        r = self._client.post('/sheets/v3/spreadsheets', json={
+            'title': title, 'folder_token': folder_token,
+        }, headers=self._headers())
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') != 0:
+            raise RuntimeError(f"创建 Spreadsheet 失败: {d.get('msg')} (code={d.get('code')})")
+        spreadsheet = (d.get('data') or {}).get('spreadsheet') or {}
+        token = spreadsheet.get('spreadsheet_token') or ''
+        if not token:
+            raise RuntimeError('创建 Spreadsheet 成功但响应缺少 spreadsheet_token')
+        return spreadsheet
+
+    def add_sheet(self, spreadsheet: str, title: str, index: int = 1) -> str:
+        """在独立结果 Spreadsheet 新建一个结果子表并返回 Sheet ID。"""
+        body = {'requests': [{'addSheet': {'properties': {
+            'title': title, 'index': index,
+        }}}]}
+        r = self._client.post(
+            f'/sheets/v2/spreadsheets/{spreadsheet}/sheets_batch_update',
+            json=body, headers=self._headers())
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') != 0:
+            raise RuntimeError(f"创建结果子表失败: {d.get('msg')} (code={d.get('code')})")
+        replies = (d.get('data') or {}).get('replies') or []
+        props = ((replies[0].get('addSheet') or {}).get('properties')
+                 if replies else {}) or {}
+        sheet_id = props.get('sheetId') or props.get('sheet_id') or ''
+        if not sheet_id:
+            # 部分响应不返回 properties；从元数据按唯一标题回查。
+            matches = [s.get('sheet_id') for s in self.query_sheets(spreadsheet)
+                       if s.get('title') == title and s.get('sheet_id')]
+            if len(matches) != 1:
+                raise RuntimeError(f'创建后无法唯一定位结果子表: {title}')
+            sheet_id = matches[0]
+        return sheet_id
+
+    def inspect_weekly_registry(self, registry_url: str,
+                                configured_sheet_id: str = '') -> dict:
+        """只读解析固定登记表并返回唯一登记 Sheet 的记录。"""
+        spreadsheet, obj_type = self.resolve_wiki_obj(registry_url)
+        if obj_type != 'sheet':
+            raise RuntimeError(f'固定登记表必须指向电子表格，当前类型: {obj_type}')
+        sheet_map = self.list_sheets(spreadsheet)
+        if configured_sheet_id:
+            candidates = [(title, sid) for title, sid in sheet_map.items()
+                          if sid == configured_sheet_id]
+            if not candidates:
+                raise RuntimeError(f'配置的登记 Sheet ID 不存在: {configured_sheet_id}')
+        else:
+            candidates = list(sheet_map.items())
+
+        matches = []
+        errors = {}
+        for title, sheet_id in candidates:
+            try:
+                values = self.read_values(spreadsheet, sheet_id, 'A1:Z500')
+                records = parse_registry_values(values)
+                matches.append((title, sheet_id, records))
+            except RuntimeError as exc:
+                errors[title] = str(exc)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f'必须识别到唯一登记子表，当前匹配 {len(matches)} 个；'
+                f'扫描结果: {errors}'
+            )
+        title, sheet_id, records = matches[0]
+        return {
+            'spreadsheet_token': spreadsheet,
+            'obj_type': obj_type,
+            'sheet_title': title,
+            'sheet_id': sheet_id,
+            'records': records,
+            'sheet_count': len(sheet_map),
+        }
 
     def read_values(self, spreadsheet: str, sheet_id: str, rng: str) -> list[list]:
         r = self._client.get(
@@ -462,12 +771,22 @@ class FeishuClient:
         """覆盖紧凑目标表前保存 A:V 快照，供迁移/误操作恢复。"""
         from config import OUTPUT_DIR
         import json
-        values = self.read_values(spreadsheet, sheet_id, 'A1:V2000')
         path = OUTPUT_DIR / 'target_backups' / run_id / f'{sheet}.json'
+        if path.is_file():
+            saved = json.loads(path.read_text(encoding='utf-8'))
+            if saved.get('sheet') != sheet or not isinstance(saved.get('values'), list):
+                raise RuntimeError(f'原始备份无效，停止覆盖: {path}')
+            if saved.get('spreadsheet_token', spreadsheet) != spreadsheet:
+                raise RuntimeError('备份目标与当前结果表不一致')
+            return path  # Preserve the pre-write image across retries of the same run.
+        from sheet_io import read_rows
+        from runtime_state import atomic_json
+        info = next((s for s in self.query_sheets(spreadsheet) if s['sheet_id'] == sheet_id), {})
+        capacity = (info.get('grid_properties') or {}).get('row_count') or 2000
+        values = read_rows(self, spreadsheet, sheet_id, last='V', row_count=capacity)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'sheet': sheet, 'range': 'A1:V2000', 'values': values},
-                      f, ensure_ascii=False, indent=1)
+        atomic_json(path, {'sheet': sheet, 'sheet_id': sheet_id, 'spreadsheet_token': spreadsheet,
+                          'range': f'A1:V{capacity}', 'values': values})
         return path
 
     # ---------- 紧凑基础数据同步：A:G 原始字段，H:M 抓取结果 ----------

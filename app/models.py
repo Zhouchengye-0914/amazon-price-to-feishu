@@ -14,6 +14,7 @@ class PageStatus(str, Enum):
     SOLD_OUT = 'sold_out'            # 页面存在但无价格，业务归类售罄
     CRAWL_ERROR = 'crawl_error'      # 技术异常：captcha/blocked/超时/空白/通信失败
     PARSE_ERROR = 'parse_error'      # 页面正常但无法按规则解析（冲突/结构变化）
+    CURRENCY_ERROR = 'currency_error'  # Marketplace/币种未知或不一致，禁止价格比较
     SOURCE_INVALID = 'source_data_invalid'  # 源数据无效（E/K 为空），不抓取，六列输出 '-'
 
 
@@ -43,6 +44,8 @@ class ReportRow:
     i_value: str | Decimal | None = None  # 本周折扣值（原值，可为 % 文本或金额）
     target_price: Decimal | None = None   # 目标成交价（K 列公式结果）
     target_price_source: str = TARGET_SOURCE_MISSING   # 来源追踪
+    marketplace: str = 'US'
+    product_url: str = ''
 
     def as_dict(self) -> dict:
         return {
@@ -52,6 +55,7 @@ class ReportRow:
             'i_value': str(self.i_value) if self.i_value is not None else None,
             'target_price': str(self.target_price) if self.target_price is not None else None,
             'target_price_source': self.target_price_source,
+            'marketplace': self.marketplace, 'product_url': self.product_url,
         }
 
 
@@ -68,6 +72,7 @@ class PriceCandidate:
 class CrawlResult:
     """单个 ASIN 的完整抓取+计算结果（含诊断字段，飞书只用六列）"""
     asin: str
+    run_id: str = ''
     status: PageStatus = PageStatus.OK
     error: str = ''
 
@@ -96,6 +101,20 @@ class CrawlResult:
     page_url: str = ''
     page_title: str = ''
     duration_ms: int = 0
+    marketplace: str = 'US'
+    currency_code: str = ''
+    product_url: str = ''
+    location_verified: bool = False
+    risk_cooldown_seconds: float = 0.0
+    html_path: str = ''
+    html_url: str = ''
+    html_sha256: str = ''
+    html_size_bytes: int = 0
+    archive_ms: int = 0
+    archive_status: str = ''
+    archive_error: str = ''
+    post_archive_delay_seconds: float = 0.0
+    stripped_noncore_css_resources: int = 0
 
     def six_columns(self) -> list:
         """飞书固定六列（顺序固定）：展示价格/折扣类型/折扣值/最终价格/一致性检查/时间戳"""
@@ -112,7 +131,8 @@ class CrawlResult:
 
     def as_dict(self) -> dict:
         return {
-            'asin': self.asin, 'status': self.status.value, 'error': self.error,
+            'asin': self.asin, 'run_id': self.run_id,
+            'status': self.status.value, 'error': self.error,
             'display_price': str(self.display_price) if self.display_price is not None else None,
             'discount_type': self.discount_type,
             'discount_value': self.discount_value,
@@ -138,4 +158,13 @@ class CrawlResult:
             'attempt_count': self.attempt_count,
             'page_url': self.page_url, 'page_title': self.page_title,
             'duration_ms': self.duration_ms,
+            'marketplace': self.marketplace, 'currency_code': self.currency_code,
+            'product_url': self.product_url, 'location_verified': self.location_verified,
+            'risk_cooldown_seconds': self.risk_cooldown_seconds,
+            'html_path': self.html_path, 'html_url': self.html_url,
+            'html_sha256': self.html_sha256, 'html_size_bytes': self.html_size_bytes,
+            'archive_ms': self.archive_ms, 'archive_status': self.archive_status,
+            'archive_error': self.archive_error,
+            'post_archive_delay_seconds': self.post_archive_delay_seconds,
+            'stripped_noncore_css_resources': self.stripped_noncore_css_resources,
         }

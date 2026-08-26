@@ -3,13 +3,14 @@
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cache import (
-    data_signature, is_cache_valid, load_sheet_cache, restore_from_cache,
+    SCHEMA_VERSION, data_signature, is_cache_valid, load_sheet_cache, restore_from_cache,
     save_sheet_cache,
 )
 from models import CrawlResult, PageStatus, ReportRow
@@ -35,7 +36,12 @@ def mk_crawls():
     r1 = CrawlResult(asin='B0AAA11111', status=PageStatus.OK,
                      display_price=Decimal('39.99'), discount_type='原价调整',
                      discount_value='-10.00', final_price=Decimal('39.99'),
-                     match='✅(0.00)', timestamp='2026-08-21 16:00:00')
+                     match='✅(0.00)', timestamp='2026-08-21 16:00:00',
+                     marketplace='US', currency_code='USD',
+                     product_url='https://www.amazon.com/dp/B0AAA11111',
+                     html_path='D:/archive/a.html', html_url='file:///D:/archive/a.html',
+                     html_sha256='abc', html_size_bytes=123456, archive_ms=987,
+                     archive_status='ok', post_archive_delay_seconds=1.5)
     r2 = CrawlResult(asin='B0BBB22222', status=PageStatus.CRAWL_ERROR,
                      error='captcha', match='-', timestamp='2026-08-21 16:00:00')
     return [r1, r2]
@@ -56,23 +62,25 @@ class TestCacheValid(unittest.TestCase):
             run_id = 'test_run'
             # 直接构造 meta（避免依赖全局目录）
             meta = {
-                'schema_version': 2,
+                'schema_version': SCHEMA_VERSION,
                 'parser_rule_version': DEFAULTS['parser_rule_version'],
                 'snapshot_id': run_id,
                 'sheet': 'PD03',
                 'asin_signature': data_signature(mk_rows()),
                 'price_tolerance': '0.50',
-                'created_at': '2026-08-21T16:00:00',
+                'marketplaces': ['US'],
+                'html_archive_enabled': False,
+                'created_at': datetime.now().isoformat(timespec='seconds'),
                 'records': {},
             }
-            cfg = mk_cfg()
+            cfg = mk_cfg(html_archive_enabled=False)
             self.assertTrue(is_cache_valid(meta, cfg, 'PD03', mk_rows()))
             # sheet 不符
             self.assertFalse(is_cache_valid(meta, cfg, 'PD17', mk_rows()))
             # 容差不符
-            self.assertFalse(is_cache_valid(meta, mk_cfg(price_tolerance='1.00'), 'PD03', mk_rows()))
+            self.assertFalse(is_cache_valid(meta, mk_cfg(price_tolerance='1.00', html_archive_enabled=False), 'PD03', mk_rows()))
             # 规则版本不符
-            self.assertFalse(is_cache_valid(meta, mk_cfg(parser_rule_version='old'), 'PD03', mk_rows()))
+            self.assertFalse(is_cache_valid(meta, mk_cfg(parser_rule_version='old', html_archive_enabled=False), 'PD03', mk_rows()))
             # 源数据变化
             rows2 = mk_rows()
             rows2[0].normal_price = Decimal('55.00')
@@ -80,15 +88,36 @@ class TestCacheValid(unittest.TestCase):
 
     def test_expired(self):
         meta = {
-            'schema_version': 2,
+            'schema_version': SCHEMA_VERSION,
             'parser_rule_version': DEFAULTS['parser_rule_version'],
             'snapshot_id': 'r', 'sheet': 'PD03',
             'asin_signature': data_signature(mk_rows()),
             'price_tolerance': '0.50',
-            'created_at': '2026-01-01T00:00:00',   # 过期
+            'marketplaces': ['US'],
+            'html_archive_enabled': False,
+            'created_at': (
+                datetime.now() - timedelta(hours=DEFAULTS['cache_max_age_hours'] + 1)
+            ).isoformat(timespec='seconds'),
             'records': {},
         }
-        self.assertFalse(is_cache_valid(meta, mk_cfg(), 'PD03', mk_rows()))
+        self.assertFalse(is_cache_valid(meta, mk_cfg(html_archive_enabled=False), 'PD03', mk_rows()))
+
+    def test_enabled_archive_cache_requires_existing_file(self):
+        meta = {
+            'schema_version': SCHEMA_VERSION,
+            'parser_rule_version': DEFAULTS['parser_rule_version'],
+            'snapshot_id': 'r', 'sheet': 'PD03',
+            'asin_signature': data_signature(mk_rows()),
+            'price_tolerance': '0.50', 'marketplaces': ['US'],
+            'html_archive_enabled': True,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'records': {'B0AAA11111': {
+                'status': 'ok', 'archive_status': 'ok',
+                'html_path': 'D:/does-not-exist/archive.html',
+            }},
+        }
+        self.assertFalse(is_cache_valid(meta, mk_cfg(html_archive_enabled=True),
+                                        'PD03', mk_rows()))
 
 
 class TestSaveRestore(unittest.TestCase):
@@ -103,11 +132,19 @@ class TestSaveRestore(unittest.TestCase):
                 save_sheet_cache('run1', 'PD03', rows, crawls, mk_cfg())
                 meta = load_sheet_cache('run1', 'PD03')
                 self.assertIsNotNone(meta)
+                self.assertEqual(meta['marketplaces'], ['US'])
+                self.assertEqual(meta['currency_codes'], ['USD'])
                 # 断点：复用 ok，跳过 crawl_error
                 reuse = restore_from_cache(meta, rows)
                 self.assertIn('B0AAA11111', reuse)
                 self.assertNotIn('B0BBB22222', reuse)
                 self.assertEqual(reuse['B0AAA11111'].final_price, Decimal('39.99'))
+                self.assertEqual(reuse['B0AAA11111'].currency_code, 'USD')
+                self.assertEqual(reuse['B0AAA11111'].product_url,
+                                 'https://www.amazon.com/dp/B0AAA11111')
+                self.assertEqual(reuse['B0AAA11111'].html_url,
+                                 'file:///D:/archive/a.html')
+                self.assertEqual(reuse['B0AAA11111'].archive_status, 'ok')
                 # 中断后续跑：todo 只包含未完成
                 todo = [r for r in rows if r.asin not in reuse]
                 self.assertEqual([r.asin for r in todo], ['B0BBB22222'])
@@ -127,7 +164,7 @@ class TestSaveRestore(unittest.TestCase):
                 cr = CrawlResult(asin='B0COUP1X', status=PageStatus.OK,
                                  display_price=Decimal('59.99'),
                                  coupon_pct=Decimal('0.25'), coupon_amount=Decimal('15.00'),
-                                 expected_type='coupon')
+                                 expected_type='coupon', marketplace='US', currency_code='USD')
                 compute_result(row, cr, '0.50')
                 before = cr.six_columns()
 

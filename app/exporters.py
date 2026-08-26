@@ -10,7 +10,8 @@ from config import CSV_DIR
 from models import CrawlResult, ReportRow
 
 CSV_FIELDS = [
-    'sheet', 'row_num', 'asin', 'sku', 'page_status',
+    'sheet', 'row_num', 'asin', 'sku', 'marketplace', 'currency_code',
+    'product_url', 'page_status',
     'display_price', 'discount_type', 'discount_value', 'discount_unit',
     'final_price', 'target_price', 'price_diff', 'match',
     'price_rule', 'promotion_raw', 'attempt_count', 'timestamp', 'error',
@@ -31,9 +32,10 @@ def export_results(sheet: str, rows: list[ReportRow], crawls: list[CrawlResult],
                 return round(float(d), 2) if d is not None else ''
             w.writerow([
                 sheet, r.row_num if r else '', cr.asin, r.sku if r else '',
+                cr.marketplace, cr.currency_code, cr.product_url,
                 cr.status.value,
                 _num(cr.display_price), cr.discount_type, cr.discount_value,
-                '%' if cr.discount_value.endswith('%') else 'USD',
+                '%' if cr.discount_value.endswith('%') else (cr.currency_code or ''),
                 _num(cr.final_price), _num(cr.target_price), _num(cr.price_diff), cr.match,
                 cr.price_rule, cr.promotion_raw, cr.attempt_count, cr.timestamp, cr.error,
             ])

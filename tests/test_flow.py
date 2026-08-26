@@ -18,6 +18,7 @@ from config import DEFAULTS
 
 def mk_cfg(**kw):
     cfg = dict(DEFAULTS)
+    cfg['html_archive_enabled'] = False
     cfg.update(kw)
     return cfg
 
@@ -26,10 +27,13 @@ class FakeWorker:
     """代替真实 AmazonWorker（不启动浏览器）"""
     fetched: list = []
 
-    def __init__(self, headless=True, us_zip='90210', proxy=None, tabs=1):
+    def __init__(self, headless=True, us_zip='90210', proxy=None, tabs=1,
+                 marketplace='US', postal_code=None):
         self.tab = mock.MagicMock()
         self.tab.html = '<html></html>'
         self.proxy = proxy
+        self.marketplace = marketplace
+        self.postal_code = postal_code
         self._tabs = [mock.MagicMock() for _ in range(max(1, tabs))]
         self._free = list(self._tabs)
 
@@ -39,12 +43,15 @@ class FakeWorker:
     def release(self, tab):
         self._free.append(tab)
 
-    def setup(self):
+    def setup(self, strict_location=True):
         return True
 
     def fetch_with_retry(self, tab, row, cfg):
         FakeWorker.fetched.append(row.asin)
         cr = CrawlResult(asin=row.asin)
+        cr.marketplace = row.marketplace
+        cr.currency_code = 'CAD' if row.marketplace == 'CA' else 'USD'
+        cr.product_url = row.product_url
         if row.asin == 'B0AAA11111':
             cr.status = PageStatus.OK
             cr.display_price = Decimal('39.99')
@@ -54,8 +61,12 @@ class FakeWorker:
         else:
             cr.status = PageStatus.CRAWL_ERROR
             cr.error = '模拟失败'
-        cr.timestamp = '2026-08-21 16:00:00'
+        from datetime import datetime
+        cr.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         return cr, tab
+
+    def wait_after_archive(self, cfg, archive_validated):
+        return 1.5
 
     def quit(self):
         pass
@@ -128,16 +139,60 @@ class FakeLogger:
 
 
 class TestFlow(unittest.TestCase):
+    def test_failed_incremental_and_final_cache_do_not_lose_valid_results(self):
+        import main
+        self._setup_dirs()
+        cfg = mk_cfg(html_archive_enabled=False, html_archive_required=False, save_every=1)
+        rows = [ReportRow(row_num=2, asin='B0AAA11111', marketplace='US')]
+        with mock.patch('main.AmazonBrowser', FakeWorker), \
+             mock.patch('main.save_sheet_cache', side_effect=OSError('temporary disk error')):
+            crawls = main.run_fetch('cache-failure', 'PD03', rows, cfg, True, True, mock.Mock())
+        self.assertEqual(crawls[0].status, PageStatus.OK)
+        self.assertEqual(crawls[0].display_price, Decimal('39.99'))
+
+    def test_tab_acquire_failure_is_recorded_for_every_row(self):
+        import main
+        self._setup_dirs()
+        cfg = mk_cfg(html_archive_enabled=False, html_archive_required=False)
+        rows = [ReportRow(row_num=2, asin='B0AAA11111', marketplace='US'),
+                ReportRow(row_num=3, asin='B0BBB22222', marketplace='US')]
+        with mock.patch('main.AmazonBrowser', FakeWorker), \
+             mock.patch.object(FakeWorker, 'acquire', side_effect=RuntimeError('tab unavailable')):
+            crawls = main.run_fetch('tab-failure', 'PD03', rows, cfg, True, True, mock.Mock())
+        self.assertEqual(len(crawls), 2)
+        self.assertTrue(all(c.status == PageStatus.CRAWL_ERROR and 'tab unavailable' in c.error for c in crawls))
+
+    def test_price_only_waits_once_per_item_and_requires_postal_verification(self):
+        import main
+        self._setup_dirs()
+        cfg = mk_cfg(html_archive_enabled=False, html_archive_required=False)
+        rows = [ReportRow(row_num=2, asin='B0AAA11111', marketplace='US')]
+        with mock.patch('main.AmazonBrowser', FakeWorker), \
+             mock.patch.object(FakeWorker, 'setup', return_value=True) as setup, \
+             mock.patch.object(FakeWorker, 'wait_after_archive', return_value=1.5) as wait, \
+             mock.patch('main.SingleFileArchiver', side_effect=AssertionError('HTML must remain off')):
+            crawls = main.run_fetch('price-wait', 'PD03', rows, cfg, True, True, FakeLogger())
+        setup.assert_called_once_with(strict_location=True)
+        wait.assert_called_once()
+        self.assertEqual(crawls[0].post_archive_delay_seconds, 1.5)
+
     def _setup_dirs(self):
         td = tempfile.TemporaryDirectory()
         import config as config_mod
         import cache as cache_mod
         import exporters as exp_mod
+        import main
         self.addCleanup(td.cleanup)
         tmp = Path(td.name)
-        cache_mod.CACHE_ROOT = tmp / 'fetch_cache'
-        cache_mod.SNAPSHOT_DIR = tmp / 'snapshots'
-        exp_mod.CSV_DIR = tmp / 'csv'
+        for module, name, value in (
+                (cache_mod, 'CACHE_ROOT', tmp / 'fetch_cache'),
+                (cache_mod, 'SNAPSHOT_DIR', tmp / 'snapshots'),
+                (exp_mod, 'CSV_DIR', tmp / 'csv'),
+                (main, 'OUTPUT_DIR', tmp),
+                (config_mod, 'OUTPUT_DIR', tmp)):
+            patcher = mock.patch.object(module, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         cache_mod.CACHE_ROOT.mkdir(parents=True)
         cache_mod.SNAPSHOT_DIR.mkdir(parents=True)
         exp_mod.CSV_DIR.mkdir(parents=True)
@@ -276,6 +331,86 @@ class TestFlow(unittest.TestCase):
             main.full_flow(fc, cfg, ['PD03'], args, logger)
         # 旧缓存签名不匹配 → 全部重新抓取
         self.assertEqual(len(FakeWorker.fetched), 2)
+
+    def test_run_fetch_archives_same_result_and_caches_local_url(self):
+        import main
+        from types import SimpleNamespace
+        tmp = self._setup_dirs()
+        cfg = mk_cfg(html_archive_enabled=True, html_archive_required=True,
+                     html_archive_root='D:/managed-html', html_min_free_gb=0)
+        rows = [ReportRow(row_num=2, asin='B0AAA11111', marketplace='US')]
+
+        class Storage:
+            def __init__(self, *args): pass
+            def check_capacity(self): return {'ok': True}
+            def cleanup_expired(self): return []
+            def html_path(self, *args): return Path('D:/managed-html/a.html')
+            def file_url(self, path): return 'file:///D:/managed-html/a.html'
+            def run_dir(self, *args): return tmp / 'html-run'
+            def write_manifest(self, run_date, run_id, manifest):
+                path = self.run_dir() / 'manifest.json'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('ok', encoding='utf-8')
+                return path
+
+        class Archiver:
+            def __init__(self, *args): pass
+            def prepare_tab(self, tab): tab.prepared = True
+            def cleanup_downloads(self): return 0
+            def capture(self, tab, asin, destination, timeout, page_status):
+                self.assert_prepared = getattr(tab, 'prepared', False)
+                return SimpleNamespace(path=str(destination), sha256='abc',
+                                       size_bytes=123456, duration_ms=800,
+                                       asin=asin, source_html_sha256='src',
+                                       page_status=page_status,
+                                       external_resource_refs=0, validation='ok',
+                                       stripped_noncore_css_resources=0)
+
+        with mock.patch('main.AmazonBrowser', FakeWorker), \
+             mock.patch('main.ArchiveStorage', Storage), \
+             mock.patch('main.SingleFileArchiver', Archiver), \
+             mock.patch('main.write_html_manifest'):
+            crawls = main.run_fetch('run-archive', 'PD03', rows, cfg, True, True,
+                                    FakeLogger(), sheet_order=3)
+        self.assertEqual(crawls[0].archive_status, 'ok')
+        self.assertEqual(crawls[0].html_url, 'file:///D:/managed-html/a.html')
+        self.assertEqual(crawls[0].post_archive_delay_seconds, 1.5)
+
+    def test_archive_failure_is_recorded_and_still_waits(self):
+        import main
+        tmp = self._setup_dirs()
+        cfg = mk_cfg(html_archive_enabled=True, html_archive_required=True,
+                     html_archive_root='D:/managed-html', html_min_free_gb=0)
+        rows = [ReportRow(row_num=2, asin='B0AAA11111', marketplace='US')]
+
+        class Storage:
+            def __init__(self, *args): pass
+            def check_capacity(self): return {'ok': True}
+            def cleanup_expired(self): return []
+            def html_path(self, *args): return Path('D:/managed-html/a.html')
+            def run_dir(self, *args): return tmp / 'html-run'
+            def write_manifest(self, run_date, run_id, manifest):
+                path = self.run_dir() / 'manifest.json'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('ok', encoding='utf-8')
+                return path
+
+        class FailingArchiver:
+            def __init__(self, *args): pass
+            def prepare_tab(self, tab): pass
+            def cleanup_downloads(self): return 0
+            def capture(self, *args, **kwargs): raise RuntimeError('disk failed')
+
+        with mock.patch('main.AmazonBrowser', FakeWorker), \
+             mock.patch('main.ArchiveStorage', Storage), \
+             mock.patch('main.SingleFileArchiver', FailingArchiver), \
+             mock.patch('main.save_evidence'):
+            crawls = main.run_fetch('run-failed', 'PD03', rows, cfg, True, True,
+                                    FakeLogger())
+        self.assertEqual(crawls[0].archive_status, 'failed')
+        self.assertIn('disk failed', crawls[0].archive_error)
+        self.assertEqual(crawls[0].post_archive_delay_seconds, 1.5)
+        self.assertEqual(crawls[0].html_url, '')
 
 
 if __name__ == '__main__':

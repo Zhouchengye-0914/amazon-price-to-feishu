@@ -155,8 +155,41 @@ def decide_discount_type(cr: CrawlResult) -> tuple[str, bool]:
 
 def compute_result(row: ReportRow, cr: CrawlResult, tolerance: str) -> None:
     """填充 cr 的六列业务字段（display_price/discount_type/discount_value/final_price/match/timestamp 由调用方给）"""
-    tol = dec(tolerance) or Decimal('0.50')
+    if cr.status != PageStatus.OK:
+        cr.final_price, cr.match, cr.discount_type, cr.discount_value = None, '-', '-', ''
+        return
+    tol = dec(tolerance)
+    if tol is None:
+        tol = Decimal('0.50')
+    for value in (tol, cr.display_price, row.normal_price, row.target_price,
+                  cr.coupon_amount, cr.coupon_final, cr.coupon_pct, cr.code_pct, cr.save_pct):
+        if value is not None and not value.is_finite():
+            cr.status, cr.match = PageStatus.PARSE_ERROR, '-'
+            cr.error = 'non_finite_price: 金额或比例不是有限数字'
+            cr.final_price = None
+            return
+    if tol < 0:
+        raise ValueError('价格容差不得为负数')
+    for name in ('coupon_pct', 'code_pct', 'save_pct'):
+        value = getattr(cr, name)
+        if value is not None and not 0 < value < 1:
+            cr.status, cr.match = PageStatus.PARSE_ERROR, '-'
+            cr.error = f'invalid_promotion: {name}必须大于0且小于100%'
+            cr.final_price = None
+            return
     display = cr.display_price
+    if cr.coupon_final is not None and (cr.coupon_final <= 0 or
+            (display is not None and cr.coupon_final > display)):
+        cr.status, cr.match = PageStatus.PARSE_ERROR, '-'
+        cr.error = 'invalid_coupon_final: Coupon最终价必须大于0且不超过主价'
+        cr.final_price = None
+        return
+    if cr.coupon_amount is not None and (cr.coupon_amount < 0 or
+            (display is not None and cr.coupon_amount > display)):
+        cr.status, cr.match = PageStatus.PARSE_ERROR, '-'
+        cr.error = 'invalid_coupon_amount: 优惠金额不能为负数或超过主价'
+        cr.final_price = None
+        return
 
     if display is None or display <= 0:
         cr.status = PageStatus.SOLD_OUT if cr.status == PageStatus.OK else cr.status
@@ -211,7 +244,20 @@ def compute_result(row: ReportRow, cr: CrawlResult, tolerance: str) -> None:
             cr.match = '-'
             return
 
-    # 一致性检查
+    # 一致性检查前先验证币种。源金额币种由子表 Marketplace 唯一决定；
+    # 未知币种或跨站币种只保留解析结果，不做数值比较，也不做汇率换算。
+    expected_currency = {'US': 'USD', 'CA': 'CAD'}.get((row.marketplace or '').upper())
+    actual_currency = (cr.currency_code or '').upper()
+    if not expected_currency or actual_currency != expected_currency:
+        cr.status = PageStatus.CURRENCY_ERROR
+        cr.price_diff = None
+        cr.match = '-'
+        cr.error = (f'currency_mismatch: marketplace={row.marketplace or "unknown"}, '
+                    f'expected={expected_currency or "unknown"}, '
+                    f'actual={actual_currency or "unknown"}')
+        return
+
+    # 同币种一致性检查
     f, t = q2(cr.final_price), q2(cr.target_price)
     if f is None or t is None:
         cr.match = '-'

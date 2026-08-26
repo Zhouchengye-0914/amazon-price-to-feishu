@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""main.py — 主流程编排：CLI → 同步飞书原始周报 → 抓取计算 → 六列写回
+"""main.py — 正式流程：登记表 → 当批周报副本 → 抓取计算 → 固定结果表A:O。
+
+正式入口 --weekly-run --confirm；恢复 --weekly-push-only --run-id。
+所有CLI共享运行锁。以下旧参数仅供受限制的兼容/维护流程，不是正式全量入口。
 
 CLI（方案 19 + 当前测试方案修正）：
   --sheets PD03,PD17       只处理指定子表
@@ -19,6 +22,7 @@ CLI（方案 19 + 当前测试方案修正）：
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import queue
@@ -38,16 +42,29 @@ if sys.platform == 'win32':
 
 from amazon.crawler import AmazonBrowser
 from cache import (
+    SCHEMA_VERSION, validate_recovery_metadata, validate_record_ages,
     cleanup_debug_dirs, is_cache_valid, load_latest_snapshot, load_sheet_cache,
     make_run_id, records_to_crawls, restore_from_cache, save_sheet_cache,
     save_snapshot,
 )
-from config import BASE_DIR, DEBUG_DIR, LOG_DIR, OUTPUT_DIR, ensure_dirs, load_config
+from config import (BASE_DIR, DEBUG_DIR, LOG_DIR, OUTPUT_DIR, PROJECT_ROOT,
+                    ensure_dirs, load_config)
 from diagnostics import save_evidence
 from exporters import export_results
 from feishu import FeishuClient, col_letter
 from models import CrawlResult, PageStatus, ReportRow
 from pricing import compute_result, dec
+from weekly_registry import select_current_registry_row
+from weekly_assets import WeeklyAssetStore, initialize_weekly_assets, require_business_ready
+from weekly_result import (_read_source_plan, sync_weekly_result_base, base_fingerprint,
+                           write_weekly_result_columns)
+from archive_storage import ArchiveStorage
+from html_archive import SingleFileArchiver, write_manifest as write_html_manifest
+from weekly_mapping import build_discovery, save_discovery, validate_discovery
+from product_links import audit_manifest_links, save_link_audit
+from weekly_execution import price_only_config, ensure_price_week, atomic_json
+from publication_guard import assert_latest_run
+from runtime_state import exclusive_run, RunBusy
 
 
 # ============================ 日志 ============================
@@ -78,24 +95,53 @@ def p(logger, msg: str):
 
 # ============================ CLI ============================
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description='PP周报·亚马逊价格校验 + 飞书六列回写')
-    ap.add_argument('--sheets', default=None, help='逗号分隔(默认美国站 11 表)')
+    ap = argparse.ArgumentParser(description='Amazon周报前端价格捕捉：--weekly-run --confirm')
+    ap.add_argument('--sheets', default=None, help='逗号分隔；正式周报默认发现全部业务子表（含CPD）')
     ap.add_argument('--asins', default=None, help='逗号分隔 ASIN，只抓指定商品(自动 dry-run)')
     ap.add_argument('--limit', type=int, default=None, help='每表前 N 行(自动隐含 --dry-run)')
     ap.add_argument('--no-headless', action='store_true', help='显示浏览器调试')
     ap.add_argument('--force-fetch', action='store_true', help='忽略缓存重新抓取')
-    ap.add_argument('--fetch-only', action='store_true', help='同步+抓取，不写飞书六列')
-    ap.add_argument('--push-only', action='store_true', help='用最近快照缓存推送，不抓取')
+    ap.add_argument('--fetch-only', action='store_true', help='只读+抓取，不写飞书')
+    ap.add_argument('--push-only', action='store_true', help='已停用；请使用 --weekly-push-only --run-id 批次 --confirm')
     ap.add_argument('--dry-run', action='store_true', help='只读+计算+本地输出，不改飞书')
     ap.add_argument('--resume', action='store_true', help='恢复最近有效的未完成批次')
     ap.add_argument('--run-id', default=None, help='明确恢复指定批次(排错用)')
     ap.add_argument('--force-push', action='store_true', help='异常比例超阈值时仍写入飞书')
     ap.add_argument('--inspect-feishu-layout', action='store_true',
                     help='只读预检目标表布局(表头行/ASIN起始行/旧列/J:O)')
+    ap.add_argument('--inspect-weekly-registry', action='store_true',
+                    help='只读解析固定周报登记表并选择当前有效周报')
+    ap.add_argument('--create-snapshot-poc', action='store_true',
+                    help='创建一个 TEST 周报完整副本并校验（必须配合 --confirm）')
+    ap.add_argument('--create-result-poc', action='store_true',
+                    help='创建一个 TEST 独立结果 Spreadsheet 与 A:P 表头（必须配合 --confirm）')
+    ap.add_argument('--new-week', action='store_true',
+                    help='按固定登记表幂等初始化本周正式快照与独立结果表（必须配合 --confirm）')
+    ap.add_argument('--recreate-weekly-assets', action='store_true',
+                    help='保留旧记录并重建本周正式资源（必须配合 --confirm）')
+    ap.add_argument('--discover-weekly-mapping', action='store_true',
+                    help='只读发现正式快照子表并生成 US/CA 结果表映射报告')
+    ap.add_argument('--audit-product-links', action='store_true',
+                    help='只读提取正式快照 ASIN 并生成 US/CA 标准商品 URL 报告')
+    ap.add_argument('--sync-weekly-result-base', action='store_true',
+                    help='从正式快照初始化/同步独立结果表 A:G（必须 --confirm）')
+    ap.add_argument('--weekly-run', action='store_true',
+                    help='新批次复制最新周报；刷新固定结果表A:G和H:O')
+    ap.add_argument('--weekly-push-only', action='store_true',
+                    help='用当前有效weekly-run结果恢复固定表A:O（必须 --run-id --confirm）')
+    ap.add_argument('--amazon-poc-marketplace', choices=('US', 'CA'), default=None,
+                    help='R1.7 单 ASIN Amazon 页面 PoC Marketplace')
+    ap.add_argument('--amazon-poc-asin', default=None,
+                    help='R1.7 单 ASIN Amazon 页面 PoC 商品编号')
     ap.add_argument('--migrate-feishu-columns', action='store_true',
                     help='一次性清理旧列并写六列表头(可配合 --sheets 限定范围)')
     ap.add_argument('--confirm', action='store_true', help='确认执行破坏性迁移')
     args = ap.parse_args()
+    if args.run_id:
+        from weekly_assets import safe_period_id
+        safe_period_id(args.run_id)
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit('--limit 必须大于0')
 
     # 互斥规则
     if args.push_only and args.fetch_only:
@@ -104,8 +150,80 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit('--push-only 与 --dry-run 互斥')
     if args.push_only and (args.force_fetch or args.resume):
         raise SystemExit('--push-only 不能与 --force-fetch/--resume 同用')
+    inspect_commands = (int(args.inspect_feishu_layout) + int(args.inspect_weekly_registry)
+                        + int(args.create_snapshot_poc))
+    inspect_commands += int(args.create_result_poc)
+    inspect_commands += int(args.new_week) + int(args.recreate_weekly_assets)
+    inspect_commands += int(args.discover_weekly_mapping)
+    inspect_commands += int(args.audit_product_links)
+    inspect_commands += int(args.sync_weekly_result_base)
+    inspect_commands += int(args.weekly_run)
+    inspect_commands += int(args.weekly_push_only)
+    inspect_commands += int(bool(args.amazon_poc_marketplace or args.amazon_poc_asin))
+    if inspect_commands > 1:
+        raise SystemExit('只读预检命令不能同时使用')
     if args.inspect_feishu_layout and (args.migrate_feishu_columns or args.fetch_only or args.push_only):
         raise SystemExit('--inspect-feishu-layout 是独立只读命令，不能与其他写操作同用')
+    if args.inspect_weekly_registry and (args.migrate_feishu_columns or args.fetch_only
+                                         or args.push_only or args.force_fetch
+                                         or args.resume or args.force_push):
+        raise SystemExit('--inspect-weekly-registry 是独立只读命令，不能与抓取或写操作同用')
+    if args.create_snapshot_poc and not args.confirm:
+        raise SystemExit('--create-snapshot-poc 会创建飞书副本，必须同时提供 --confirm')
+    if args.create_snapshot_poc and (args.migrate_feishu_columns or args.fetch_only
+                                     or args.push_only or args.force_fetch or args.resume
+                                     or args.force_push or args.dry_run or args.limit
+                                     or args.asins):
+        raise SystemExit('--create-snapshot-poc 是独立资源创建命令，不能与抓取或其他写操作同用')
+    if args.create_result_poc and not args.confirm:
+        raise SystemExit('--create-result-poc 会创建并写入 TEST 结果表，必须同时提供 --confirm')
+    if args.create_result_poc and (args.migrate_feishu_columns or args.fetch_only
+                                   or args.push_only or args.force_fetch or args.resume
+                                   or args.force_push or args.dry_run or args.limit
+                                   or args.asins):
+        raise SystemExit('--create-result-poc 是独立资源创建命令，不能与抓取或其他写操作同用')
+    if (args.new_week or args.recreate_weekly_assets) and not args.confirm:
+        raise SystemExit('每周资源初始化会创建飞书资源，必须同时提供 --confirm')
+    if (args.new_week or args.recreate_weekly_assets) and (
+            args.migrate_feishu_columns or args.fetch_only or args.push_only
+            or args.force_fetch or args.resume or args.force_push or args.dry_run
+            or args.limit or args.asins):
+        raise SystemExit('每周资源初始化是独立命令，不能与抓取或其他写操作同用')
+    if args.discover_weekly_mapping and (
+            args.migrate_feishu_columns or args.fetch_only or args.push_only
+            or args.force_fetch or args.resume or args.force_push or args.dry_run
+            or args.limit or args.asins or args.confirm):
+        raise SystemExit('--discover-weekly-mapping 是独立只读飞书发现命令，不能与其他操作同用')
+    if args.audit_product_links and (
+            args.migrate_feishu_columns or args.fetch_only or args.push_only
+            or args.force_fetch or args.resume or args.force_push or args.dry_run
+            or args.limit or args.asins or args.confirm):
+        raise SystemExit('--audit-product-links 是独立只读飞书审计命令，不能与其他操作同用')
+    if args.sync_weekly_result_base and not args.confirm:
+        raise SystemExit('--sync-weekly-result-base 会写入独立结果表，必须同时提供 --confirm')
+    if args.sync_weekly_result_base and (
+            args.migrate_feishu_columns or args.fetch_only or args.push_only
+            or args.force_fetch or args.resume or args.force_push or args.dry_run
+            or args.limit or args.asins):
+        raise SystemExit('--sync-weekly-result-base 是独立写入命令，不能与抓取或其他操作同用')
+    if args.weekly_run and args.push_only:
+        raise SystemExit('--weekly-run 暂不能与旧 --push-only 同用')
+    if args.weekly_run and not (args.dry_run or args.fetch_only or args.limit or args.asins) \
+            and not args.confirm:
+        raise SystemExit('--weekly-run 正式写入独立结果表时必须同时提供 --confirm')
+    if args.weekly_push_only and (not args.run_id or not args.confirm):
+        raise SystemExit('--weekly-push-only 必须同时提供 --run-id 和 --confirm')
+    if args.weekly_push_only and (
+            args.push_only or args.fetch_only or args.dry_run or args.force_fetch
+            or args.resume or args.force_push or args.limit or args.asins):
+        raise SystemExit('--weekly-push-only 是独立恢复写入命令，不能与抓取参数同用')
+    if bool(args.amazon_poc_marketplace) != bool(args.amazon_poc_asin):
+        raise SystemExit('--amazon-poc-marketplace 与 --amazon-poc-asin 必须同时提供')
+    if args.amazon_poc_marketplace and (
+            args.migrate_feishu_columns or args.fetch_only or args.push_only
+            or args.force_fetch or args.resume or args.force_push or args.dry_run
+            or args.limit or args.asins or args.confirm):
+        raise SystemExit('Amazon 单 ASIN PoC 是独立命令，不能与其他操作同用')
     if args.migrate_feishu_columns and (args.fetch_only or args.push_only or args.dry_run or args.limit):
         raise SystemExit('列迁移不能与抓取/推送参数同时使用(--sheets 可用于限定范围)')
     if args.limit:
@@ -128,6 +246,9 @@ def row_from_dict(d: dict) -> ReportRow:
         h_type=d.get('h_type') or '',
         i_value=dec(d.get('i_value')),
         target_price=dec(d.get('target_price')),
+        target_price_source=d.get('target_price_source') or 'missing',
+        marketplace=d.get('marketplace') or 'US',
+        product_url=d.get('product_url') or '',
     )
 
 
@@ -148,14 +269,23 @@ def assemble_crawls(rows: list[ReportRow], results_map: dict[str, CrawlResult],
 
 # ============================ 抓取 ============================
 def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
-              headless: bool, force_fetch: bool, logger) -> list[CrawlResult]:
+              headless: bool, force_fetch: bool, logger,
+              sheet_order: int = 1) -> list[CrawlResult]:
+    marketplace = (cfg.get('sheet_profiles') or {}).get(sheet, 'US')
+    from product_links import MARKETPLACES
+    profile = MARKETPLACES[marketplace]
+    for row in rows:
+        row.marketplace = marketplace
+        row.product_url = row.product_url or profile.product_url(row.asin)
     reuse: dict[str, CrawlResult] = {}
     if not force_fetch:
         meta = load_sheet_cache(run_id, sheet)
         if is_cache_valid(meta, cfg, sheet, rows):
             reuse = restore_from_cache(meta, rows)
     todo = [r for r in rows if r.asin not in reuse]
-    p(logger, f'[抓取] {sheet} 共{len(rows)}行 | 缓存复用 {len(reuse)} | 需抓 {len(todo)} | workers={cfg["workers"]}')
+    workers = min(int(cfg.get('workers', 1)), max(1, len(todo)))
+    p(logger, f'[抓取] {sheet}/{marketplace} 共{len(rows)}行 | 缓存复用 {len(reuse)} '
+              f'| 需抓 {len(todo)} | workers={workers}')
 
     results_map: dict[str, CrawlResult] = dict(reuse)
     if todo:
@@ -164,25 +294,39 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
             q.put(r)
         done_count = [0]
         lock = threading.Lock()
+        cache_write_lock = threading.Lock()
         save_state = [0]
         total = len(todo)
 
         def _save_partial():
-            # 锁内只复制结果快照，锁外写盘与重算（3.1 防死锁）
-            with lock:
-                snapshot = dict(results_map)
-            crawls = assemble_crawls(rows, snapshot, cfg, logger)
-            save_sheet_cache(run_id, sheet, rows, crawls, cfg)
+            # Serialize snapshot creation AND writes; an older snapshot cannot win last.
+            with cache_write_lock:
+                with lock:
+                    snapshot = dict(results_map)
+                crawls = assemble_crawls(rows, snapshot, cfg, logger)
+                save_sheet_cache(run_id, sheet, rows, crawls, cfg)
             logger.info(f'[缓存] {sheet} 增量保存 {len(snapshot)} 条')
 
-        workers = min(max(1, int(cfg['workers'])), len(todo))
-        # 单浏览器 + 多 tab：一个 ChromiumPage，每个线程持有一个独立 tab（并发模型）
+        postal_code = cfg['ca_postal'] if marketplace == 'CA' else cfg['us_zip']
         browser = AmazonBrowser(headless=headless, us_zip=cfg['us_zip'],
                                 proxy=cfg.get('proxy') or None,
-                                tabs=workers)
+                                tabs=workers, marketplace=marketplace,
+                                postal_code=postal_code)
+        archive_enabled = bool(cfg.get('html_archive_enabled', True))
+        storage = None
+        archiver = None
+        item_orders = {row.asin: index for index, row in enumerate(rows, start=1)}
         try:
-            if not browser.setup():
-                raise RuntimeError('浏览器初始化失败(请确认美国 VPN 节点)')
+            if not browser.setup(strict_location=True):
+                raise RuntimeError(f'浏览器初始化失败(请确认 {marketplace} 出口与邮编)')
+            if archive_enabled:
+                storage = ArchiveStorage(
+                    cfg['html_archive_root'], cfg['html_retention_days'],
+                    cfg['html_min_free_gb'], cfg.get('_html_server_base_url', ''))
+                storage.check_capacity()
+                storage.cleanup_expired()
+                archiver = SingleFileArchiver(
+                    PROJECT_ROOT, OUTPUT_DIR / 'archive_work' / marketplace)
 
             def _worker_loop():
                 while True:
@@ -190,19 +334,66 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
                         row = q.get_nowait()
                     except queue.Empty:
                         break
-                    tab = browser.acquire()
+                    tab = None
                     try:
+                        tab = browser.acquire()
+                        item_started = time.monotonic()
+                        if archiver is not None:
+                            archiver.prepare_tab(tab)
                         cr, tab = browser.fetch_with_retry(tab, row, cfg)
-                        if cr.status in (PageStatus.CRAWL_ERROR, PageStatus.PARSE_ERROR):
+                        cr.run_id = run_id
+                        if cr.status in (PageStatus.OK, PageStatus.SOLD_OUT,
+                                         PageStatus.PAGE_NOT_FOUND) and archiver is not None:
+                            destination = storage.html_path(
+                                datetime.now().date(), run_id, sheet_order, sheet,
+                                item_orders[row.asin], row.asin)
+                            try:
+                                remaining = (float(cfg['per_asin_timeout'])
+                                             - (time.monotonic() - item_started))
+                                if remaining <= 1:
+                                    raise TimeoutError(
+                                        'deadline_exceeded: 页面阶段已耗尽归档时间预算')
+                                archived = archiver.capture(
+                                    tab, row.asin, destination,
+                                    timeout=remaining,
+                                    page_status=cr.status.value)
+                                write_html_manifest(
+                                    archived, destination.with_suffix('.manifest.json'))
+                                cr.html_path = archived.path
+                                cr.html_url = storage.file_url(destination)
+                                cr.html_sha256 = archived.sha256
+                                cr.html_size_bytes = archived.size_bytes
+                                cr.archive_ms = archived.duration_ms
+                                cr.archive_status = 'ok'
+                                cr.stripped_noncore_css_resources = (
+                                    archived.stripped_noncore_css_resources)
+                            except Exception as archive_exc:
+                                cr.archive_status = 'failed'
+                                cr.archive_error = (
+                                    f'{type(archive_exc).__name__}: {str(archive_exc)[:160]}')
+                            finally:
+                                cr.duration_ms = int(
+                                    (time.monotonic() - item_started) * 1000)
+                        if cr.status in (PageStatus.CRAWL_ERROR, PageStatus.PARSE_ERROR, PageStatus.CURRENCY_ERROR) \
+                                or cr.archive_status == 'failed':
                             save_evidence(run_id, sheet, cr, tab, cfg)
                     except Exception as e:
-                        cr = CrawlResult(asin=row.asin)
+                        cr = CrawlResult(asin=row.asin, marketplace=row.marketplace,
+                                         product_url=row.product_url)
+                        cr.run_id = run_id
                         cr.status = PageStatus.CRAWL_ERROR
                         cr.error = f'{type(e).__name__}: {str(e)[:80]}'
-                        from datetime import datetime
                         cr.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     finally:
-                        browser.release(tab)
+                        try:
+                            cr.post_archive_delay_seconds = browser.wait_after_archive(
+                                cfg, archive_validated=cr.archive_status == 'ok')
+                        except Exception as exc:
+                            cr.status, cr.error = PageStatus.CRAWL_ERROR, f'商品间等待失败: {exc}'
+                            logger.error(cr.error)
+                        finally:
+                            if tab is not None:
+                                browser.release(tab)
                     should_save = False
                     with lock:
                         results_map[row.asin] = cr
@@ -214,7 +405,10 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
                     if n % 10 == 0:
                         print(f'  [{n}/{total}] {row.asin} {cr.status.value:<14} {cr.duration_ms}ms', flush=True)
                     if should_save:
-                        _save_partial()
+                        try:
+                            _save_partial()
+                        except Exception as exc:
+                            logger.error(f'[缓存保存失败] {sheet}: {exc}；继续抓取，最终保存将重试')
 
             threads = [threading.Thread(target=_worker_loop, daemon=True)
                        for _ in range(workers)]
@@ -224,9 +418,42 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
                 t.join()
         finally:
             browser.quit()
+            if archiver is not None:
+                archiver.cleanup_downloads()
 
     crawls = assemble_crawls(rows, results_map, cfg, logger)
-    save_sheet_cache(run_id, sheet, rows, crawls, cfg)
+    try:
+        save_sheet_cache(run_id, sheet, rows, crawls, cfg)
+    except Exception as exc:
+        logger.error(f'[最终缓存保存失败] {sheet}: {exc}；保留采集结果供weekly bundle持久化')
+    if cfg.get('html_archive_enabled', True):
+        storage = ArchiveStorage(cfg['html_archive_root'], cfg['html_retention_days'],
+                                 cfg['html_min_free_gb'], cfg.get('_html_server_base_url', ''))
+        run_date = datetime.now().date()
+        manifest_path = storage.run_dir(run_date, run_id) / 'manifest.json'
+        manifest = {'schema_version': 1, 'run_id': run_id,
+                    'run_date': run_date.isoformat(), 'sheets': {}}
+        if manifest_path.is_file():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding='utf-8'))
+                if loaded.get('run_id') == run_id and isinstance(loaded.get('sheets'), dict):
+                    manifest = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        manifest['sheets'][sheet] = {
+            'sheet_order': sheet_order, 'marketplace': marketplace,
+            'records': [{
+                'asin': cr.asin, 'page_status': cr.status.value,
+                'archive_status': cr.archive_status, 'html_path': cr.html_path,
+                'html_url': cr.html_url, 'sha256': cr.html_sha256,
+                'size_bytes': cr.html_size_bytes, 'archive_ms': cr.archive_ms,
+                'post_archive_delay_seconds': cr.post_archive_delay_seconds,
+                'error': cr.archive_error,
+                'stripped_noncore_css_resources': cr.stripped_noncore_css_resources,
+            } for cr in crawls],
+        }
+        manifest['updated_at'] = datetime.now().isoformat()
+        storage.write_manifest(run_date, run_id, manifest)
     return crawls
 
 
@@ -237,17 +464,20 @@ def summarize(results_by_sheet: dict[str, list[CrawlResult]], cfg: dict, logger)
     st = Counter()
     mt = Counter()
     dt = Counter()
+    currencies = Counter()
     total = 0
     for crawls in results_by_sheet.values():
         for cr in crawls:
             st[cr.status.value] += 1
             mt[cr.match.split('(')[0] if cr.match else '-'] += 1
             dt[cr.discount_type or '-'] += 1
+            currencies[cr.currency_code or 'unknown'] += 1
             if cr.status != PageStatus.SOURCE_INVALID:
                 total += 1
     p(logger, f'=== 状态: ' + ' '.join(f'{k}={v}' for k, v in st.most_common()))
     p(logger, f'=== 一致性: ' + ' '.join(f'{k}={v}' for k, v in mt.most_common()))
     p(logger, f'=== 类型: ' + ' '.join(f'{k}={v}' for k, v in dt.most_common()))
+    p(logger, f'=== 币种: ' + ' '.join(f'{k}={v}' for k, v in currencies.most_common()))
     if total:
         err = st.get('crawl_error', 0) + st.get('parse_error', 0)
         ratio = err / total
@@ -352,14 +582,15 @@ def full_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -> N
 
     # 6. 抓取 + 计算 + CSV
     results_by_sheet: dict[str, list[CrawlResult]] = {}
-    for sheet, rows in rows_by_sheet.items():
+    for sheet_order, (sheet, rows) in enumerate(rows_by_sheet.items(), start=1):
         if args.limit:
             rows = rows[:args.limit]
         if not rows:
             continue
         crawls = run_fetch(run_id, sheet, rows, cfg,
                            headless=not args.no_headless,   # 3.2 方向修正
-                           force_fetch=args.force_fetch, logger=logger)
+                           force_fetch=args.force_fetch, logger=logger,
+                           sheet_order=sheet_order)
         results_by_sheet[sheet] = crawls
         csv_path = export_results(sheet, rows, crawls, run_id)
         p(logger, f'[{sheet}] 完成 {len(crawls)} 行 → {csv_path.name}')
@@ -418,6 +649,9 @@ def full_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -> N
             'run_id': run_id,
             'finished_at': datetime.now().isoformat(timespec='seconds'),
             'sheets': {s: len(v) for s, v in results_by_sheet.items()},
+            'currency_counts': dict(Counter(
+                cr.currency_code or 'unknown'
+                for values in results_by_sheet.values() for cr in values)),
             'invalid_rows': len(invalid),
             'error_ratio': error_ratio,
             'pushed': bool(should_push),
@@ -505,6 +739,841 @@ def inspect_flow(fc: FeishuClient, cfg: dict, sheets: list[str], logger) -> None
     p(logger, '===== 预检完成：人工确认每个 Sheet 的输出范围后，再执行单 Sheet 迁移 =====')
 
 
+def inspect_weekly_registry_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    from datetime import timedelta, timezone
+
+    p(logger, '===== 固定周报登记表只读预检（不写任何数据）=====')
+    started = time.monotonic()
+    info = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    now = datetime.now(timezone(timedelta(hours=8)))
+    selected = select_current_registry_row(
+        info['records'], now, cfg['feishu_allowed_hosts'])
+    elapsed = time.monotonic() - started
+    token = info['spreadsheet_token']
+    masked = f'{token[:5]}...{token[-4:]}' if len(token) > 10 else '<masked>'
+    p(logger, f'登记表: {info["sheet_title"]} ({info["sheet_id"]})')
+    p(logger, f'Spreadsheet Token: {masked} | 工作簿子表数: {info["sheet_count"]}')
+    valid_links = sum(bool(str(item.get('source_url') or '').strip())
+                      for item in info['records'])
+    p(logger, f'扫描数据行: {len(info["records"])} | 有效链接行: {valid_links} | 当前行: {selected.row_number}')
+    if selected.sequence is not None:
+        p(logger, f'当前序号: {selected.sequence} | 更新时间原值: {selected.raw.get("updated_at")}')
+    else:
+        p(logger, f'当前周期: {selected.period_id} | 生效时间(UTC): {selected.effective_at.isoformat()}')
+    p(logger, f'当前周报资源类型: {selected.source_url.split("/")[3]}')
+    p(logger, f'只读预检耗时: {elapsed:.3f}s')
+    p(logger, '===== 预检完成：未执行飞书写入 =====')
+
+
+def create_snapshot_poc_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    """R1.2：从登记表当前周报创建唯一 TEST 副本并验证完整结构。"""
+    from datetime import timedelta, timezone
+
+    p(logger, '===== R1.2 TEST 完整快照副本 PoC =====')
+    total_started = time.monotonic()
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selected = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    p(logger, f'登记表当前行已解析: row={selected.row_number}, period={selected.period_id}')
+    source_token, source_type = fc.resolve_wiki_obj(selected.source_url)
+    if source_type != 'sheet':
+        raise RuntimeError(f'完整副本 PoC 只接受电子表格，当前底层类型: {source_type}')
+
+    p(logger, '开始读取原周报结构指纹（只读）')
+    source_before = fc.spreadsheet_structure(source_token)
+    p(logger, f'原周报结构读取完成: {source_before["sheet_count"]} 个子表')
+    prefix = 'TEST_周报完整快照_'
+    recent = [item for item in fc.list_root_files()
+              if str(item.get('name') or '').startswith(prefix)
+              and (item.get('type') == 'sheet') and item.get('token')]
+    copy_started = time.monotonic()
+    if recent:
+        copied = recent[0]
+        copy_name = copied.get('name') or prefix + 'RECOVERED'
+        p(logger, f'找回已有待校验 TEST 副本: {copy_name}；本次不重复创建')
+    else:
+        copy_name = prefix + datetime.now().strftime('%Y%m%d_%H%M%S')
+        copied = fc.copy_file(source_token, 'sheet', copy_name, '')
+    copy_elapsed = time.monotonic() - copy_started
+    copy_token = copied['token']
+    masked_pending = f'{copy_token[:5]}...{copy_token[-4:]}'
+    pending_dir = OUTPUT_DIR / 'poc_resources'
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / 'r1_2_snapshot_pending.json'
+    pending_path.write_text(json.dumps({
+        'name': copy_name, 'token_masked': masked_pending,
+        'url': copied.get('url') or '', 'created_at': datetime.now().isoformat(),
+        'status': 'pending_validation',
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    p(logger, f'副本 Token 已记录: {masked_pending}；开始只读就绪轮询')
+
+    copied_structure = fc.wait_spreadsheet_structure(copy_token)
+    p(logger, '副本结构读取完成，开始复核原周报未变化')
+    source_after = fc.spreadsheet_structure(source_token)
+    if source_before != source_after:
+        raise RuntimeError('复制前后原周报结构指纹发生变化，PoC 停止')
+    if source_before['sheets'] != copied_structure['sheets']:
+        raise RuntimeError('副本与原周报的子表、行列容量或 A1:P10 关键内容不一致')
+
+    pending_path.write_text(json.dumps({
+        'name': copy_name, 'token_masked': masked_pending,
+        'url': copied.get('url') or '', 'created_at': datetime.now().isoformat(),
+        'status': 'validated', 'source_sha256': source_before['sha256'],
+        'copy_sha256': copied_structure['sha256'],
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    masked_source = f'{source_token[:5]}...{source_token[-4:]}'
+    masked_copy = f'{copy_token[:5]}...{copy_token[-4:]}'
+    p(logger, f'源周报: {masked_source} | 类型: {source_type} | 子表: {source_before["sheet_count"]}')
+    p(logger, f'源结构 SHA256: {source_before["sha256"]}')
+    p(logger, f'副本: {masked_copy} | 名称: {copied.get("name") or copy_name}')
+    p(logger, f'副本 URL: {copied.get("url") or "<API未返回>"}')
+    p(logger, f'复制 API 耗时: {copy_elapsed:.3f}s | 总耗时: {time.monotonic() - total_started:.3f}s')
+    p(logger, '===== R1.2 PoC 通过：原表未写入，TEST 副本只读校验完成 =====')
+
+
+RESULT_HEADERS = [
+    'ASIN', 'SKU', '尺寸', '正常售价', '本周折扣形式', '本周折扣值', '目标成交价',
+    '展示价格', '折扣类型', '折扣值', '最终价格', '一致性检查', '时间戳',
+    'HTML链接', '币种', 'Amazon链接',
+]
+
+
+def create_result_poc_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    """R1.3：创建独立 TEST 结果表，只写测试子表 A2:P2。"""
+    p(logger, '===== R1.3 TEST 独立结果 Spreadsheet PoC =====')
+    started = time.monotonic()
+    prefix = 'TEST_独立结果表_'
+    existing = [item for item in fc.list_root_files()
+                if str(item.get('name') or '').startswith(prefix)
+                and item.get('type') == 'sheet' and item.get('token')]
+    if existing:
+        file_info = existing[0]
+        token = file_info['token']
+        title = file_info.get('name') or prefix + 'RECOVERED'
+        p(logger, f'找回已有 TEST 独立结果表: {title}；本次不重复创建')
+    else:
+        title = prefix + datetime.now().strftime('%Y%m%d_%H%M%S')
+        created = fc.create_spreadsheet(title, '')
+        token = created['spreadsheet_token']
+        file_info = {'name': created.get('title') or title,
+                     'url': created.get('url') or ''}
+        p(logger, '创建 API 已返回独立 Spreadsheet Token')
+
+    masked = f'{token[:5]}...{token[-4:]}'
+    record_dir = OUTPUT_DIR / 'poc_resources'
+    record_dir.mkdir(parents=True, exist_ok=True)
+    record_path = record_dir / 'r1_3_result_spreadsheet.json'
+    record_path.write_text(json.dumps({
+        'name': title, 'token_masked': masked, 'url': file_info.get('url') or '',
+        'status': 'pending_validation', 'created_at': datetime.now().isoformat(),
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    sheets = fc.query_sheets(token)
+    matches = [s for s in sheets if s.get('title') == 'TEST_RESULT']
+    if len(matches) > 1:
+        raise RuntimeError('TEST_RESULT 子表重名，停止写入')
+    if matches:
+        sheet_id = matches[0]['sheet_id']
+    else:
+        sheet_id = fc.add_sheet(token, 'TEST_RESULT', len(sheets))
+        p(logger, f'已创建测试结果子表: TEST_RESULT ({sheet_id})')
+
+    current = fc.read_values(token, sheet_id, 'A2:P2')
+    if current and any(str(cell or '').strip() for cell in current[0]):
+        if current[0][:16] != RESULT_HEADERS:
+            raise RuntimeError('TEST_RESULT A2:P2 已有非本规格内容，停止覆盖')
+    else:
+        write_started = time.monotonic()
+        fc.write_values(token, sheet_id, 'A2:P2', [RESULT_HEADERS])
+        p(logger, f'A2:P2 写入耗时: {time.monotonic() - write_started:.3f}s')
+    verified = fc.read_values(token, sheet_id, 'A2:P2')
+    if not verified or verified[0][:16] != RESULT_HEADERS:
+        raise RuntimeError('结果表 A2:P2 回读与固定 16 列表头不一致')
+
+    # 三个受保护资源必须保持相互独立。
+    source_token, _ = fc.resolve_wiki_obj(cfg['feishu_target_wiki'])
+    if token == source_token:
+        raise RuntimeError('新结果表 Token 与参考目标表相同，停止')
+    url = file_info.get('url') or f'https://wit0jhu6kvu.feishu.cn/sheets/{token}'
+    record_path.write_text(json.dumps({
+        'name': title, 'token_masked': masked, 'url': url, 'sheet_id': sheet_id,
+        'status': 'validated', 'header_range': 'A2:P2',
+        'header_count': len(RESULT_HEADERS), 'validated_at': datetime.now().isoformat(),
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    p(logger, f'结果 Spreadsheet: {masked} | Sheet: TEST_RESULT ({sheet_id})')
+    p(logger, f'结果表 URL: {url}')
+    p(logger, f'总耗时: {time.monotonic() - started:.3f}s')
+    p(logger, '===== R1.3 PoC 通过：仅写入新建 TEST 结果表 A2:P2 =====')
+
+
+def initialize_week_flow(fc: FeishuClient, cfg: dict, logger,
+                         recreate: bool = False) -> None:
+    """R1.4：固定登记表驱动的幂等每周资源初始化。"""
+    from datetime import timedelta, timezone
+
+    p(logger, '===== R1.4 每周资源初始化 =====')
+    started = time.monotonic()
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    manifest, reused = initialize_weekly_assets(fc, store, selection, {
+        'url': cfg['weekly_registry_url'],
+        'spreadsheet_token': registry['spreadsheet_token'],
+        'sheet_id': registry['sheet_id'],
+    }, recreate=recreate,
+        manager_open_id=cfg.get('feishu_manager_open_id', ''))
+    snap = manifest['snapshot']
+    result = manifest['result']
+    p(logger, f'周期: {manifest["period_id"]} | generation={manifest["generation"]} '
+              f'| reused={reused}')
+    p(logger, f'正式快照: {snap["spreadsheet_token"][:5]}...{snap["spreadsheet_token"][-4:]} '
+              f'| {snap.get("url") or "<API未返回URL>"}')
+    p(logger, f'正式结果表: {result["spreadsheet_token"][:5]}...{result["spreadsheet_token"][-4:]} '
+              f'| {result.get("url") or "<API未返回URL>"}')
+    p(logger, f'Manifest: outputs/weekly_runs/{manifest["period_id"]}/weekly_manifest.json')
+    p(logger, f'总耗时: {time.monotonic() - started:.3f}s')
+    p(logger, '===== R1.4 初始化完成 =====')
+
+
+def _notify_manager(fc: FeishuClient, cfg: dict, logger, text: str) -> str:
+    """正式阶段完成后通知固定人工管理员；通知失败即不宣告任务完成。"""
+    open_id = cfg.get('feishu_manager_open_id', '')
+    if not open_id:
+        raise RuntimeError('缺少 feishu_manager_open_id，无法发送任务完成通知')
+    message_id = fc.send_text_message(open_id, text)
+    p(logger, f'[通知] 已通知周成业 | message_id={message_id}')
+    return message_id
+
+
+def require_daily_week_ready(fc: FeishuClient, cfg: dict) -> dict:
+    """在任何普通抓取/写回之前确定当前登记周期并执行 manifest 门禁。"""
+    from datetime import timedelta, timezone
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    return require_business_ready(store, selection.period_id)
+
+
+def discover_weekly_mapping_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    """R1.5：从当前正式快照生成确定性子表映射，不写飞书。"""
+    from datetime import timedelta, timezone
+    p(logger, '===== R1.5 正式快照子表只读发现 =====')
+    started = time.monotonic()
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    manifest = store.load(selection.period_id)
+    if not manifest or manifest.get('status') != 'ready':
+        raise RuntimeError('当前周期正式资源未初始化，请先运行 --new-week --confirm')
+    snapshot_token = manifest['snapshot']['spreadsheet_token']
+    report = build_discovery(fc, snapshot_token)
+    report_path = save_discovery(
+        report, OUTPUT_DIR / 'discovery' / f'{selection.period_id}_sheet_mapping.json')
+    validate_discovery(report)
+    mappings = [item for item in report['sheets']
+                if item['status'] in ('mapped', 'mapped_empty')]
+    manifest['mapping_ready'] = True
+    manifest['business_ready'] = False  # R1.13 创建结果子表并同步 A:G 后才可置 true。
+    manifest['sheet_mappings'] = mappings
+    manifest['discovery'] = {
+        'report_path': str(report_path.relative_to(OUTPUT_DIR.parent)),
+        'discovered_at': report['discovered_at'],
+        'sheet_count': report['sheet_count'], 'mapped_count': report['mapped_count'],
+        'excluded_count': report['excluded_count'], 'unknown_count': report['unknown_count'],
+    }
+    store.save(selection.period_id, manifest)
+    us = sum(item['marketplace'] == 'US' for item in mappings)
+    ca = sum(item['marketplace'] == 'CA' for item in mappings)
+    p(logger, f'快照子表: {report["sheet_count"]} | 映射: {len(mappings)} '
+              f'(US={us}, CA={ca}) | 排除: {report["excluded_count"]}')
+    for item in report['sheets']:
+        p(logger, f'  #{item["source_order"]:02d} {item["source_sheet"]}: '
+                  f'{item["marketplace"]} | ASIN列非空={item["nonempty_asin_cells"]} '
+                  f'| 初步合法={item["preliminary_valid_asins"]}')
+    p(logger, f'发现报告: {report_path.relative_to(OUTPUT_DIR.parent)}')
+    p(logger, f'总耗时: {time.monotonic() - started:.3f}s')
+    p(logger, '===== R1.5 发现完成：未执行飞书写入 =====')
+
+
+def audit_product_links_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    """R1.6：只读审计 ASIN 单元格并生成标准商品 URL。"""
+    from datetime import timedelta, timezone
+    p(logger, '===== R1.6 ASIN 与商品链接只读审计 =====')
+    started = time.monotonic()
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    manifest = store.load(selection.period_id)
+    if not manifest or not manifest.get('mapping_ready'):
+        raise RuntimeError('当前周期尚未完成 R1.5 子表映射')
+    report = audit_manifest_links(fc, manifest)
+    path = save_link_audit(
+        report, OUTPUT_DIR / 'discovery' / f'{selection.period_id}_product_links.json')
+    manifest['link_audit'] = {
+        'report_path': str(path.relative_to(OUTPUT_DIR.parent)),
+        'valid_count': report['valid_count'], 'invalid_count': report['invalid_count'],
+        'audited_at': datetime.now().isoformat(),
+    }
+    manifest['link_rules_ready'] = report['invalid_count'] == 0
+    manifest['currency_model'] = {
+        'US': 'USD', 'CA': 'CAD',
+        'cross_currency_comparison': 'blocked',
+        'ready': True,
+    }
+    manifest['business_ready'] = False
+    store.save(selection.period_id, manifest)
+    p(logger, f'有效标准链接: {report["valid_count"]} | 无效: {report["invalid_count"]} '
+              f'| 非商品标签跳过: {report["skipped_non_product_count"]}')
+    for sheet in report['sheets']:
+        if sheet['valid_count'] or sheet['invalid_count'] or sheet['skipped_non_product_count']:
+            p(logger, f'  {sheet["sheet"]} {sheet["marketplace"]}: '
+                      f'valid={sheet["valid_count"]}, invalid={sheet["invalid_count"]}, '
+                      f'skipped={sheet["skipped_non_product_count"]}')
+            reasons = {}
+            for item in sheet['invalid']:
+                reasons[item['reason']] = reasons.get(item['reason'], 0) + 1
+            if reasons:
+                p(logger, f'    invalid reasons: {reasons}')
+    p(logger, f'审计报告: {path.relative_to(OUTPUT_DIR.parent)}')
+    p(logger, f'总耗时: {time.monotonic() - started:.3f}s')
+    p(logger, '===== R1.6 审计完成：未启动 Amazon，未写飞书 =====')
+
+
+def sync_weekly_result_base_flow(fc: FeishuClient, cfg: dict, logger) -> None:
+    """R1.13：从本周固定快照初始化独立结果表 A:G。"""
+    from datetime import timedelta, timezone
+    p(logger, '===== R1.13 独立结果表 A:G 初始化 =====')
+    started = time.monotonic()
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    run_id = 'base-' + datetime.now().strftime('%Y%m%d-%H%M%S')
+    result = sync_weekly_result_base(fc, store, selection.period_id, cfg, run_id)
+    for item in result['sheets']:
+        p(logger, f'  {item["sheet"]}: rows={item["rows"]}, '
+                  f'invalid_retained={item["invalid_rows_retained"]}, '
+                  f'sheet_id={item["sheet_id"]}')
+    p(logger, f'周期: {result["period_id"]} | 子表: {len(result["sheets"])} '
+              f'| A:G 数据行: {result["row_count"]}')
+    p(logger, f'总耗时: {time.monotonic() - started:.3f}s')
+    p(logger, '===== R1.13 完成：business_ready=true =====')
+
+
+def _rename_run_result(fc, store, manifest, run_id):
+    from result_notification import result_title
+    from weekly_assets import assert_result_write_target
+    token = manifest['result']['spreadsheet_token']
+    assert_result_write_target(manifest, token)
+    fixed = store.fixed_result()
+    assert_latest_run(store, manifest, run_id)
+    if fixed and fixed['spreadsheet_token'] != token:
+        raise RuntimeError('改名目标与固定结果表不一致')
+    title = result_title(manifest['period_id'], run_id)
+    fc.rename_spreadsheet(token, title)
+    manifest['result']['name'] = title
+    manifest['result']['last_run_id'] = run_id
+    store.save(manifest['period_id'], manifest)
+    if fixed:
+        atomic_json(store.root / 'fixed_result.json', {**fixed, 'name': title})
+
+
+def _notify_run_collaborators(fc, cfg, logger, run_id, text, out):
+    from result_notification import send_to_recipients
+    discovery_error = ''
+    try:
+        recipients = fc.application_collaborators()
+    except Exception as exc:
+        recipients = []
+        discovery_error = str(exc)
+    recipients.append(cfg.get('feishu_manager_open_id', ''))
+    # Changing timestamps alone must not resend the same business result on recovery.
+    semantic = '\n'.join(line for line in text.splitlines() if not line.startswith(
+        ('开始：', '结束：', '完整耗时：', '本地数据：')))
+    message_key = hashlib.sha256(semantic.encode('utf-8')).hexdigest()
+    receipt_root = out.parent if out.parent.name == 'daily_runs' else out
+    ledger_path = receipt_root / 'notification_receipts' / f'{run_id}.json'
+    ledger = json.loads(ledger_path.read_text(encoding='utf-8')) if ledger_path.is_file() else {}
+    previous = (ledger.get(message_key) or {}).get('sent', [])
+    delivered = {item['open_id'] for item in previous}
+    path = out / f'{run_id}_notifications.json'
+    def save_receipts(partial):
+        report = {**partial, 'sent': previous + partial['sent'], 'run_id': run_id,
+                  'message_key': message_key, 'discovery_error': discovery_error,
+                  'sent_at': datetime.now().isoformat()}
+        ledger[message_key] = report
+        atomic_json(ledger_path, ledger)
+        atomic_json(path, report)
+    report = send_to_recipients(fc, [r for r in recipients if r not in delivered], text,
+                                local_data_open_id=cfg.get('feishu_manager_open_id', ''),
+                                checkpoint=save_receipts)
+    save_receipts(report)
+    report['sent'] = previous + report['sent']
+    report.update(run_id=run_id, discovery_error=discovery_error,
+                  sent_at=datetime.now().isoformat())
+    atomic_json(path, report)
+    p(logger, f'[通知] 应用协作者成功 {len(report["sent"])} 人，失败 {len(report["failed"])} 人；记录 {path}')
+    if discovery_error or report['failed']:
+        p(logger, '[通知未完全送达] ' + json.dumps(report['failed'], ensure_ascii=False) + discovery_error)
+        # Delivery failures are recorded separately from the completed data write.
+        send_to_recipients(fc, [cfg.get('feishu_manager_open_id', '')],
+                          f'Amazon通知存在未送达成员，请检查应用可用范围。\nrun_id: {run_id}\n本地数据: {path}',
+                          local_data_open_id=cfg.get('feishu_manager_open_id', ''))
+
+
+def weekly_daily_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -> None:
+    """Price-only daily flow; HTML services are never a prerequisite."""
+    from datetime import timedelta, timezone
+    started = time.monotonic()
+    started_at = datetime.now()
+    cfg = price_only_config(cfg)
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    manifest = ensure_price_week(fc, store, selection, registry, cfg,
+                                 allow_create=not args.dry_run and not args.fetch_only,
+                                 run_id=(run_id := _price_run_id(store, selection.period_id, args)),
+                                 resume=bool(getattr(args, 'resume', False) or getattr(args, 'run_id', None)))
+    selected = [item for item in manifest['sheet_mappings']
+                if not getattr(args, 'sheets', '') or item['result_sheet'] in set(sheets)]
+    cfg['sheet_profiles'] = {item['result_sheet']: item['marketplace'] for item in selected}
+    if not selected:
+        raise RuntimeError('请求的子表不在本周 manifest 映射中')
+    plans = _read_source_plan(fc, manifest['snapshot']['spreadsheet_token'], selected, cfg)
+    fingerprints = {p['mapping']['result_sheet']: base_fingerprint(p) for p in plans}
+    if manifest.get('source_fingerprints') is not None and manifest['source_fingerprints'] != fingerprints:
+        raise RuntimeError('本批快照基础字段已改变，禁止继续复用旧价格')
+    manifest['source_fingerprints'] = fingerprints
+    rows_by_sheet = {plan['mapping']['result_sheet']: list(plan['valid_rows'])
+                     for plan in plans if plan['valid_rows']}
+    invalid_by_sheet = {plan['mapping']['result_sheet']: list(plan['invalid'])
+                        for plan in plans if plan['invalid']}
+    for plan in plans:
+        marketplace = plan['mapping']['marketplace']
+        from product_links import MARKETPLACES
+        profile = MARKETPLACES[marketplace]
+        for row in plan['rows']:
+            row.marketplace = marketplace
+            row.product_url = profile.product_url(row.asin)
+    if args.asins:
+        wanted = {item.strip() for item in args.asins.split(',') if item.strip()}
+        rows_by_sheet = {sheet: [row for row in rows if row.asin in wanted]
+                         for sheet, rows in rows_by_sheet.items()}
+        rows_by_sheet = {sheet: rows for sheet, rows in rows_by_sheet.items() if rows}
+        invalid_by_sheet = {
+            sheet: [item for item in items if item['asin'] in wanted]
+            for sheet, items in invalid_by_sheet.items()
+        }
+    if args.limit:
+        rows_by_sheet = {sheet: rows[:args.limit]
+                         for sheet, rows in rows_by_sheet.items()}
+    if not rows_by_sheet and not any(invalid_by_sheet.values()) and (args.asins or args.limit):
+        raise RuntimeError('本次筛选没有可处理的 ASIN')
+    if not args.dry_run and not args.fetch_only:
+        scope = [item['result_sheet'] for item in selected]
+        if manifest.get('delivery_scope') and manifest['delivery_scope'] != scope:
+            raise RuntimeError('恢复批次子表范围不能改变，请使用原始范围')
+        manifest['delivery_scope'] = scope
+        store.save(selection.period_id, manifest)
+    save_snapshot(run_id, {
+        'period_id': selection.period_id,
+        'snapshot_spreadsheet_token': manifest['snapshot']['spreadsheet_token'],
+        'result_spreadsheet_token': manifest['result']['spreadsheet_token'],
+    }, rows_by_sheet)
+    p(logger, f'===== weekly-run {run_id} | period={selection.period_id} =====')
+    results_by_sheet = {}
+    out = OUTPUT_DIR / 'daily_runs' / datetime.now().strftime('%Y-%m-%d')
+    bundle_path = out / f'{run_id}_weekly_bundle.json'
+    def save_bundle():
+        atomic_json(bundle_path, {
+            'schema_version': 2, 'run_id': run_id, 'period_id': selection.period_id,
+            'parser_rule_version': cfg['parser_rule_version'],
+            'price_tolerance': str(cfg['price_tolerance']),
+            'source_fingerprints': fingerprints,
+            'snapshot_spreadsheet_token': manifest['snapshot']['spreadsheet_token'],
+            'result_spreadsheet_token': manifest['result']['spreadsheet_token'],
+            'created_at': datetime.now().isoformat(),
+            'sheets': {s: [cr.as_dict() for cr in values] for s, values in results_by_sheet.items()},
+        })
+    order_by_sheet = {item['result_sheet']: item['source_order'] for item in selected}
+    for sheet, rows in rows_by_sheet.items():
+        try:
+            crawls = run_fetch(run_id, sheet, rows, cfg,
+                               headless=not args.no_headless,
+                               force_fetch=args.force_fetch, logger=logger,
+                               sheet_order=order_by_sheet[sheet])
+        except Exception as exc:
+            crawls = [CrawlResult(asin=row.asin, run_id=run_id, status=PageStatus.CRAWL_ERROR,
+                                 error=f'子表抓取失败: {exc}', marketplace=row.marketplace,
+                                 product_url=row.product_url) for row in rows]
+        results_by_sheet[sheet] = crawls
+        save_bundle()
+        try:
+            export_results(sheet, rows, crawls, run_id)
+        except Exception as exc:
+            p(logger, f'[CSV导出失败，bundle已保存] {sheet}: {exc}')
+    for sheet, items in invalid_by_sheet.items():
+        for item in items:
+            row = item['report_row']
+            cr = CrawlResult(asin=row.asin, run_id=run_id,
+                             status=PageStatus.SOURCE_INVALID,
+                             error=f"源数据无效: {item['reason']}", match='-',
+                             discount_type='-', marketplace=row.marketplace,
+                             currency_code=('CAD' if row.marketplace == 'CA' else 'USD'),
+                             product_url=row.product_url,
+                             timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            results_by_sheet.setdefault(sheet, []).append(cr)
+    if not args.asins and not args.limit:
+        for item in selected:
+            results_by_sheet.setdefault(item['result_sheet'], [])
+    save_bundle()
+    error_ratio = summarize(results_by_sheet, cfg, logger)
+    should_write = not args.dry_run and not args.fetch_only
+    if error_ratio > cfg['max_error_ratio_for_push'] and not args.force_push:
+        # 长期全量任务按行收口：技术异常/归档失败行由写入器逐行阻断，
+        # 已验证安全的行仍应交付，避免少量或成组异常让整批永久零写入。
+        p(logger, f'[weekly-run] 技术异常比例 {error_ratio:.1%}，批次标记 degraded；'
+                  '继续写入逐行门禁通过的结果，异常行进入恢复清单')
+    report = {'run_id': run_id, 'written_rows': 0, 'blocked': [], 'failures': []}
+    if should_write:
+        report = _deliver_weekly_results(fc, store, manifest, run_id, results_by_sheet, cfg, out)
+        p(logger, f'[weekly-run] H:O 写入 {report["written_rows"]} 行，'
+                  f'阻断 {len(report["blocked"])} 行')
+    else:
+        p(logger, '[weekly-run] dry/fetch-only：未写飞书')
+    (out / f'{run_id}_weekly_summary.json').write_text(json.dumps({
+        **report, 'period_id': selection.period_id,
+        'elapsed_seconds': round(time.monotonic() - started, 3),
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    if not args.dry_run and not args.fetch_only:
+        from result_notification import completion_text
+        elapsed = time.monotonic() - started
+        text = completion_text(
+            period_id=selection.period_id, run_id=run_id,
+            started_at=started_at.isoformat(timespec='seconds'),
+            finished_at=datetime.now().isoformat(timespec='seconds'),
+            elapsed_seconds=elapsed, sheet_count=len(results_by_sheet),
+            written_rows=report['written_rows'], blocked_count=len(report['blocked']),
+            error_ratio=error_ratio, result_name=manifest['result']['name'],
+            result_url=manifest['result']['url'], local_data=str(bundle_path))
+        text = _delivery_notice(text, report)
+        _notify_run_collaborators(fc, cfg, logger, run_id, text, out)
+
+
+def _price_run_id(store, period_id, args):
+    if getattr(args, 'run_id', None):
+        return args.run_id
+    if getattr(args, 'resume', False):
+        old = store.load(period_id) or {}
+        if not old.get('snapshot_run_id'):
+            raise RuntimeError('没有可恢复的当前批次，请新建正式运行')
+        return old['snapshot_run_id']
+    candidate = make_run_id()
+    current = store.load(period_id) or {}
+    if current.get('snapshot_run_id') == candidate or (OUTPUT_DIR / 'snapshots' / candidate).exists():
+        candidate += '_' + datetime.now().strftime('%f')
+    return candidate
+
+
+def _delivery_notice(text, report):
+    if report.get('failures'):
+        text += '\n注意：本次存在写入、校验或表名更新异常；仅回读验证通过的行计入写入数。'
+    if report.get('blocked'):
+        text += '\n阻断行不代表本次有效价格；写入失败的范围可能保留旧数据，请结合时间戳查看。'
+    return text
+
+
+def _deliver_weekly_results(fc, store, manifest, run_id, results, cfg, out):
+    path = out / f'{run_id}_delivery.json'
+    last_verified = {}
+    def checkpoint(report):
+        # Keep verified progress even when the checkpoint or final manifest write fails.
+        from copy import deepcopy
+        last_verified.clear()
+        last_verified.update(deepcopy(report))
+        atomic_json(path, report)
+    checkpoint({'run_id': run_id, 'status': 'pending', 'written_rows': 0})
+    try:
+        assert_latest_run(store, manifest, run_id)
+        if manifest.get('base_sync_pending') or manifest.get('snapshot_run_id'):
+            fixed = store.fixed_result()
+            if not fixed or fixed['spreadsheet_token'] != manifest['result']['spreadsheet_token']:
+                raise RuntimeError('换周发布目标不是固定结果表')
+            if manifest.get('snapshot_run_id') not in (None, '', run_id):
+                raise RuntimeError('批次快照身份不匹配')
+            report = sync_weekly_result_base(
+                fc, store, manifest['period_id'], cfg, run_id, staged_results=results,
+                selected_sheets=manifest.get('delivery_scope'), checkpoint=checkpoint)
+            manifest.update(store.load(manifest['period_id']))
+        else:
+            report = write_weekly_result_columns(fc, manifest, run_id, results, cfg, checkpoint=checkpoint)
+    except Exception as exc:
+        report = dict(last_verified)
+        verified = report.get('verified', {})
+        blocked = report.setdefault('blocked', [])
+        existing_blocked = {(item['sheet'], item['asin']) for item in blocked}
+        blocked.extend({'sheet': sheet, 'asin': cr.asin, 'reason': str(exc)}
+                       for sheet, crawls in results.items() for cr in crawls
+                       if not verified.get(f'{sheet}:{cr.asin}')
+                       and (sheet, cr.asin) not in existing_blocked)
+        report.setdefault('failures', []).append({'stage': 'delivery', 'error': str(exc)})
+    if (report['written_rows'] or report.get('base_rows_written')
+            or ('base_rows_written' in report and not report['failures'] and not report['blocked'])):
+        try:
+            assert_latest_run(store, manifest, run_id)
+            fixed = store.fixed_result()
+            atomic_json(store.root / 'fixed_result.json', {
+                **fixed, 'period_id': manifest['period_id'], 'run_id': run_id})
+            _rename_run_result(fc, store, manifest, run_id)
+        except Exception as exc:
+            report['failures'].append({'stage': 'rename', 'error': str(exc)})
+    report['status'] = 'partial' if report['failures'] or report['blocked'] else 'complete'
+    checkpoint(report)
+    # Publish the new result pointer only after the entire batch verifies.
+    all_sheets = {item['result_sheet'] for item in manifest.get('sheet_mappings', [])}
+    if report['status'] == 'complete' and set(results) == all_sheets:
+        atomic_json(store.root / 'active_result.json', {
+            'period_id': manifest['period_id'], 'run_id': run_id, 'result': manifest['result'],
+            'updated_at': datetime.now().isoformat()})
+    return report
+
+
+def _load_weekly_push_results(run_id: str, sheets: list[str], manifest: dict,
+                              cfg: dict | None = None) -> dict:
+    snapshot_path = OUTPUT_DIR / 'snapshots' / run_id / 'source.json'
+    if not snapshot_path.is_file():
+        raise RuntimeError(f'weekly-run 快照不存在: {run_id}')
+    snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+    source_meta = snapshot.get('source_meta') or {}
+    if source_meta.get('period_id') != manifest.get('period_id'):
+        raise RuntimeError('缓存周期与当前 manifest 不一致')
+    if source_meta.get('snapshot_spreadsheet_token') != manifest['snapshot']['spreadsheet_token']:
+        raise RuntimeError('缓存不是来自当前 manifest 固定快照')
+    if source_meta.get('result_spreadsheet_token') != manifest['result']['spreadsheet_token']:
+        raise RuntimeError('缓存登记的独立结果表已变化')
+    results = {}
+    bundle_matches = list((OUTPUT_DIR / 'daily_runs').glob(
+        f'*/{run_id}_weekly_bundle.json'))
+    if len(bundle_matches) > 1:
+        raise RuntimeError(f'发现多个同 run_id weekly bundle: {run_id}')
+    if bundle_matches:
+        bundle = json.loads(bundle_matches[0].read_text(encoding='utf-8'))
+        if bundle.get('schema_version') != 2 or bundle.get('run_id') != run_id:
+            raise RuntimeError('weekly bundle schema 或 run_id 不匹配')
+        if cfg is not None:
+            validate_recovery_metadata(bundle, cfg)
+            validate_record_ages([r for sheet in sheets for r in (bundle.get('sheets') or {}).get(sheet, [])], cfg)
+            if manifest.get('source_fingerprints') is not None and bundle.get('source_fingerprints') != manifest['source_fingerprints']:
+                raise RuntimeError('恢复bundle源字段指纹不一致，禁止混用旧价格')
+        if bundle.get('period_id') != manifest.get('period_id'):
+            raise RuntimeError('weekly bundle 周期不匹配')
+        if bundle.get('snapshot_spreadsheet_token') != manifest['snapshot']['spreadsheet_token']:
+            raise RuntimeError('weekly bundle 固定快照不匹配')
+        if bundle.get('result_spreadsheet_token') != manifest['result']['spreadsheet_token']:
+            raise RuntimeError('weekly bundle 独立结果表不匹配')
+        from cache import _crawl_from_dict
+        for sheet in sheets:
+            crawls = [_crawl_from_dict(item) for item in
+                      ((bundle.get('sheets') or {}).get(sheet) or [])]
+            crawls = [item for item in crawls if item is not None]
+            if crawls or sheet in (bundle.get('sheets') or {}):
+                results[sheet] = crawls
+    else:
+        # 兼容 bundle 引入前已经完成并验证的单行 PoC 缓存。
+        for sheet in sheets:
+            meta = load_sheet_cache(run_id, sheet)
+            if not meta:
+                continue
+            if meta.get('schema_version') != SCHEMA_VERSION or meta.get('snapshot_id') != run_id:
+                raise RuntimeError(f'[{sheet}] 缓存 schema 或 snapshot_id 不匹配')
+            if cfg is not None:
+                validate_recovery_metadata(meta, cfg)
+                validate_record_ages((meta.get('records') or {}).values(), cfg)
+            crawls = records_to_crawls(meta)
+            if crawls:
+                results[sheet] = crawls
+    for sheet, crawls in results.items():
+        for cr in crawls:
+            if cr.run_id != run_id:
+                raise RuntimeError(f'[{sheet}] {cr.asin} 缓存 run_id 不匹配')
+            if cfg is not None and not cfg.get('html_archive_enabled', True):
+                continue
+            if cr.status in (PageStatus.OK, PageStatus.SOLD_OUT,
+                             PageStatus.PAGE_NOT_FOUND):
+                path = Path(cr.html_path)
+                if cr.archive_status != 'ok' or not path.is_file() or not cr.html_url:
+                    cr.archive_status = 'failed'
+                    cr.archive_error = 'html_archive_missing_or_unavailable'
+                    cr.html_url = ''
+                    continue
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if digest != cr.html_sha256:
+                    cr.archive_status = 'failed'
+                    cr.archive_error = 'html_sha256_mismatch'
+                    cr.html_url = ''
+                    continue
+                if cfg and cfg.get('html_server_enabled', True):
+                    from html_server import archive_http_url, server_status
+                    cr.html_url = archive_http_url(path, cfg, server_status(cfg))
+    if not results:
+        raise RuntimeError('指定批次没有可写入的 weekly-run 缓存')
+    return results
+
+
+def weekly_push_only_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -> None:
+    """Price-only recovery of the same snapshot and run, verified H:O writes."""
+    from datetime import timedelta, timezone
+    started = time.monotonic()
+    started_at = datetime.now()
+    cfg = price_only_config(cfg)
+    registry = fc.inspect_weekly_registry(
+        cfg['weekly_registry_url'], cfg.get('weekly_registry_sheet_id', ''))
+    selection = select_current_registry_row(
+        registry['records'], datetime.now(timezone(timedelta(hours=8))),
+        cfg['feishu_allowed_hosts'])
+    store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    manifest = store.load(selection.period_id)
+    if manifest and (manifest.get('source') or {}).get('url') != selection.source_url:
+        raise RuntimeError('同一周期源链接变化，禁止恢复旧批次')
+    if manifest and manifest.get('snapshot_run_id') not in (None, '', args.run_id):
+        raise RuntimeError('只能恢复当前批次，禁止旧快照覆盖最新A:G')
+    if not manifest or not manifest.get('base_sync_pending'):
+        manifest = require_business_ready(store, selection.period_id)
+    fixed = store.fixed_result()
+    if not fixed:
+        raise RuntimeError('缺少固定结果表登记，禁止恢复写入')
+    if (fixed['spreadsheet_token'] != manifest['result']['spreadsheet_token']
+                  or (not manifest.get('base_sync_pending') and fixed.get('period_id') != manifest['period_id'])):
+        raise RuntimeError('缓存周期不属于当前固定结果表，禁止覆盖')
+    if not getattr(args, 'sheets', ''):
+        sheets = manifest.get('delivery_scope') or [item['result_sheet'] for item in manifest['sheet_mappings']]
+    results = _load_weekly_push_results(args.run_id, sheets, manifest, cfg)
+    out = OUTPUT_DIR / 'daily_runs' / datetime.now().strftime('%Y-%m-%d')
+    out.mkdir(parents=True, exist_ok=True)
+    report = _deliver_weekly_results(fc, store, manifest, args.run_id, results, cfg, out)
+    (out / f'{args.run_id}_weekly_push.json').write_text(json.dumps({
+        **report, 'period_id': selection.period_id,
+        'result_spreadsheet_token': manifest['result']['spreadsheet_token'],
+        'verified_at': datetime.now().isoformat(),
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    p(logger, f'[weekly-push-only] 写入并回读 {report["written_rows"]} 行；'
+              f'阻断 {len(report["blocked"])} 行')
+    from result_notification import completion_text
+    text = completion_text(
+        period_id=selection.period_id, run_id=args.run_id,
+        started_at=started_at.isoformat(timespec='seconds'),
+        finished_at=datetime.now().isoformat(timespec='seconds'),
+        elapsed_seconds=time.monotonic() - started, sheet_count=len(results),
+        written_rows=report['written_rows'], blocked_count=len(report['blocked']),
+        result_name=manifest['result']['name'], result_url=manifest['result']['url'],
+        local_data=str(out / (args.run_id + '_weekly_push.json')))
+    text = _delivery_notice(text, report)
+    _notify_run_collaborators(fc, cfg, logger, args.run_id, text, out)
+
+
+def _result_for_verify(cr: CrawlResult) -> list:
+    from weekly_result import result_values
+    return result_values(cr)
+
+
+def _cells_equal(actual, expected) -> bool:
+    if isinstance(actual, list) and len(actual) == 1 and isinstance(actual[0], dict):
+        rich = actual[0]
+        actual = rich.get('link') or rich.get('text') or ''
+    if actual in (None, '') and expected in (None, ''):
+        return True
+    if isinstance(actual, (int, float)) or isinstance(expected, (int, float)):
+        try:
+            return dec(actual) == dec(expected)
+        except Exception:
+            pass
+    return str(actual) == str(expected)
+
+
+def amazon_marketplace_poc_flow(cfg: dict, logger, args) -> None:
+    """R1.7：单 Marketplace/单 ASIN 页面与区域上下文 PoC。"""
+    from product_links import MARKETPLACES, normalize_product
+    p(logger, f'===== R1.7 {args.amazon_poc_marketplace} 单 ASIN PoC =====')
+    started = time.monotonic()
+    marketplace = args.amazon_poc_marketplace
+    asin, product_url = normalize_product(args.amazon_poc_asin, marketplace)
+    profile = MARKETPLACES[marketplace]
+    postal = cfg['ca_postal'] if marketplace == 'CA' else cfg['us_zip']
+    row = ReportRow(row_num=0, asin=asin, marketplace=marketplace,
+                    product_url=product_url)
+    browser = AmazonBrowser(
+        headless=not args.no_headless, us_zip=cfg['us_zip'],
+        proxy=cfg.get('proxy') or None, tabs=1,
+        marketplace=marketplace, postal_code=postal)
+    tab = None
+    try:
+        if not browser.setup(strict_location=True):
+            debug_dir = OUTPUT_DIR / 'debug' / 'r1_7_location'
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            p(logger, f'区域设置失败阶段: {browser.location_error} | '
+                      f'page={getattr(browser.page, "url", "")} | '
+                      f'title={str(getattr(browser.page, "title", ""))[:120]}')
+            try:
+                (debug_dir / f'{marketplace.lower()}_setup.html').write_text(
+                    browser.page.html or '', encoding='utf-8')
+            except Exception:
+                pass
+            raise RuntimeError(f'{marketplace} 邮编设置未能回读验证，禁止继续商品抓取')
+        tab = browser.acquire()
+        result, tab = browser.fetch_with_retry(tab, row, cfg)
+        html = tab.html or ''
+        currency_marker = f'"priceCurrency":"{profile.currency_code}"'
+        currency_evidence = (currency_marker in html.replace(' ', '')
+                             or profile.currency_code in html)
+        report = result.as_dict()
+        report.update({
+            'postal_code': postal, 'domain': profile.domain,
+            'location_verification_method': browser.location_verification_method,
+            'currency_evidence_in_html': currency_evidence,
+            'html_bytes_in_memory': len(html.encode('utf-8')),
+            'poc_elapsed_seconds': round(time.monotonic() - started, 3),
+            'archive_attempted': False,
+            'post_archive_delay_applied': False,
+        })
+        out_dir = OUTPUT_DIR / 'poc_resources'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f'r1_7_{marketplace.lower()}_{asin}.json'
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        p(logger, f'URL: {product_url} | postal_verified={result.location_verified} '
+                  f'| method={browser.location_verification_method}')
+        p(logger, f'status={result.status.value} | currency={result.currency_code} '
+                  f'| currency_evidence={currency_evidence} | duration={result.duration_ms}ms')
+        p(logger, f'报告: {out_path.relative_to(OUTPUT_DIR.parent)}')
+        if result.status not in (PageStatus.OK, PageStatus.SOLD_OUT, PageStatus.PAGE_NOT_FOUND):
+            raise RuntimeError(f'Amazon PoC 未通过: {result.error}')
+        p(logger, '===== R1.7 单 ASIN PoC 通过 =====')
+    finally:
+        if tab is not None:
+            browser.release(tab)
+        browser.quit()
+
+
 def migrate_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -> None:
     p(logger, '===== 一次性列迁移开始 =====')
     target_ss = fc.resolve_wiki(cfg['feishu_target_wiki'])
@@ -514,7 +1583,8 @@ def migrate_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logger) -
 
 
 # ============================ 入口 ============================
-def main():
+def _main_unlocked():
+    process_started = time.monotonic()
     args = parse_args()
     cfg = load_config()
     ensure_dirs()
@@ -524,16 +1594,59 @@ def main():
 
     fc = FeishuClient(cfg)
     try:
-        if args.inspect_feishu_layout:
+        if args.inspect_weekly_registry:
+            inspect_weekly_registry_flow(fc, cfg, logger)
+        elif args.create_snapshot_poc:
+            create_snapshot_poc_flow(fc, cfg, logger)
+        elif args.create_result_poc:
+            create_result_poc_flow(fc, cfg, logger)
+        elif args.new_week or args.recreate_weekly_assets:
+            initialize_week_flow(fc, cfg, logger,
+                                 recreate=args.recreate_weekly_assets)
+        elif args.discover_weekly_mapping:
+            discover_weekly_mapping_flow(fc, cfg, logger)
+        elif args.audit_product_links:
+            audit_product_links_flow(fc, cfg, logger)
+        elif args.sync_weekly_result_base:
+            sync_weekly_result_base_flow(fc, cfg, logger)
+        elif args.weekly_run:
+            weekly_daily_flow(fc, cfg, sheets, args, logger)
+        elif args.weekly_push_only:
+            weekly_push_only_flow(fc, cfg, sheets, args, logger)
+        elif args.amazon_poc_marketplace:
+            amazon_marketplace_poc_flow(cfg, logger, args)
+        elif args.inspect_feishu_layout:
             inspect_flow(fc, cfg, sheets, logger)
         elif args.migrate_feishu_columns:
             migrate_flow(fc, cfg, sheets, args, logger)
         elif args.push_only:
-            push_only_flow(fc, cfg, sheets, logger, args)
+            raise RuntimeError('旧推送入口已停用，请使用 --weekly-push-only --run-id 批次 --confirm')
         else:
-            full_flow(fc, cfg, sheets, args, logger)
+            raise RuntimeError('请显式使用 --weekly-run --confirm；最小验证使用 --weekly-run --dry-run --limit 1')
+    except Exception as exc:
+        formal = ((args.weekly_run and not args.dry_run and not args.fetch_only)
+                  or args.weekly_push_only)
+        if formal:
+            try:
+                _notify_manager(
+                    fc, cfg, logger,
+                    f'Amazon 周报前端价格捕捉任务异常\n'
+                    f'运行耗时: {time.monotonic() - process_started:.3f} 秒\n'
+                    f'错误: {type(exc).__name__}: {str(exc)[:500]}')
+            except Exception as notify_exc:
+                p(logger, f'[通知失败] {type(notify_exc).__name__}: {notify_exc}')
+        raise
     finally:
         fc.close()
+
+
+def main():
+    try:
+        with exclusive_run(OUTPUT_DIR / 'weekly_scheduler.lock'):
+            _main_unlocked()
+    except RunBusy as exc:
+        print(str(exc), flush=True)
+        raise SystemExit(75)
 
 
 if __name__ == '__main__':

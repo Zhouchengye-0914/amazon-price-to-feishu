@@ -121,6 +121,10 @@ class TestCode(unittest.TestCase):
     def test_no_code(self):
         self.assertEqual(parse_code(HTML_PLAIN), (None, ''))
 
+    def test_code_text_in_review_is_not_product_promotion(self):
+        html = HTML_PLAIN + '<div data-hook="reviewRichContentContainer">I got Save 30% at checkout.</div>'
+        self.assertEqual(parse_code(html), (None, ''))
+
 
 class TestCoupon(unittest.TestCase):
     def test_coupon_pct_and_saving(self):
@@ -131,6 +135,20 @@ class TestCoupon(unittest.TestCase):
 
     def test_no_coupon(self):
         self.assertEqual(parse_coupon(HTML_PLAIN), (None, None, ''))
+
+    def test_coupon_text_in_review_is_not_product_coupon(self):
+        # 真实全量样本 B0CLNRF9P3 曾因评论中的这句话被误判为 Coupon。
+        html = (HTML_CODE + HTML_PLAIN +
+                '<div data-hook="reviewRichContentContainer">I ordered it with a 30% off coupon.</div>')
+        self.assertEqual(parse_coupon(html), (None, None, ''))
+        self.assertEqual(parse_code(html)[0], Decimal('0.30'))
+
+    def test_unrelated_saving_amount_is_not_attached_to_coupon(self):
+        html = ('''<span id="couponText123" class="couponLabelText">Apply 25% coupon</span>'''
+                + ('x' * 2500) + '<div>Saving $80.00 on another item</div>')
+        pct, amount, _ = parse_coupon(html)
+        self.assertEqual(pct, Decimal('0.25'))
+        self.assertIsNone(amount)
 
 
 class TestPromotionRaw(unittest.TestCase):

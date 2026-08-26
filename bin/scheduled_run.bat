@@ -1,5 +1,4 @@
 @echo off
 set "PROJECT_ROOT=%~dp0.."
-cd /d "%PROJECT_ROOT%"
-.venv\Scripts\python.exe app\run.py
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\bin\scheduled_run.ps1"
 exit /b %errorlevel%
