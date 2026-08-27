@@ -45,6 +45,7 @@
   "feishu_target_wiki": "https://wit0jhu6kvu.feishu.cn/wiki/JbiQwDZXeiJan0k8ydRczfWNnFc",
   "weekly_registry_url": "https://wit0jhu6kvu.feishu.cn/wiki/HwxpwCnZ7iV1o5klIGbc8wJHnrd",
   "weekly_registry_sheet_id": "c1fcd1",
+  "weekly_registry_max_age_days": 8.0,
   "feishu_allowed_hosts": ["wit0jhu6kvu.feishu.cn"],
   "feishu_app_id": "cli_aa097133e3355ccd",
   "feishu_output_layout": {

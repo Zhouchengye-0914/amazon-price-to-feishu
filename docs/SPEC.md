@@ -22,7 +22,9 @@ flowchart TD
     A1 -- 否 --> A2[退出码75；不抓取、不写飞书]
     A1 -- 是 --> B[读取固定周报链接登记表]
     B --> C[选择链接非空且序号最大的唯一记录]
-    C --> D{登记与资源校验通过?}
+    C --> C1{登记首次发现未超过8天且URL未被同序号替换?}
+    C1 -- 否 --> X[保存错误并通知周成业；安全退出]
+    C1 -- 是 --> D{登记与资源校验通过?}
     D -- 否 --> X[保存错误并通知周成业；安全退出]
     D -- 是 --> E{明确恢复当前run_id?}
     E -- 是 --> F[验证批次身份、缓存版本和有效期；复用本批快照和映射]
@@ -61,6 +63,7 @@ Windows、Python 3.10+、Chromium/DrissionPage。Python依赖以 `config/require
 - 兼容凭证文件为两个非空行，App ID必须与JSON一致；不要同时维护多份本地Secret。
 - 正式任务的子表列表及Marketplace来自本批最新快照发现结果；旧静态sheets/sheet_profiles不是全量范围上限。
 - `outputs/weekly_runs/fixed_result.json` 是固定云端资源身份登记，不是重复的配置来源；部署迁移必须保留。
+- `weekly_registry_max_age_days` 默认8天：正式新批次按本机持久化的首次发现时间阻止长期沿用旧登记链接；只读检查和明确恢复既有run_id不改此账本。
 
 新增配置时同步代码默认值、模板、SPEC及测试；Secret还需同步环境变量模板和脱敏测试。禁止在日志、manifest或Git中保存Secret、tenant access token、Cookie和Authorization。
 
@@ -77,6 +80,7 @@ amazon_daily_structured_20260821/
 │   ├── models.py / pricing.py      结果模型与Decimal计算
 │   ├── feishu.py                   飞书API、源行解析与本地备份
 │   ├── weekly_registry.py          登记表选择与URL校验
+│   ├── registry_freshness.py       登记链接首次发现账本与过期门禁
 │   ├── weekly_assets.py            周资源、manifest、固定表身份和锁
 │   ├── weekly_mapping.py           全部子表发现与映射
 │   ├── product_links.py            ASIN、域名与Marketplace
@@ -87,7 +91,7 @@ amazon_daily_structured_20260821/
 │   ├── runtime_state.py            统一进程锁、独立临时文件与持久化原子JSON
 │   ├── publication_guard.py        最新批次登记及发布/改名防过期门禁
 │   ├── sheet_io.py                 按表容量分段读取，保留绝对行号
-│   ├── diagnostics.py              异常证据
+│   ├── diagnostics.py              异常截图与JSON证据，不新增页面HTML
 │   ├── amazon/                     浏览器Tab、页面解析和选择器；price_evidence.py限定主价DOM与币种证据
 │   └── html_*.py / archive_*.py / offline_verify.py / mhtml_compare.py
 │                                    独立HTML捕获、留存、服务和验证
@@ -250,7 +254,7 @@ ASIN提取支持纯编号、普通URL、飞书富文本链接及HYPERLINK公式�
 
 产物路径以第18节为准。run_id贯穿抓取快照、缓存、CSV、bundle、交付记录、目标备份和通知回执。
 
-当前文本日志按log_keep保留最近30个文件，不能写成“已保留30天”；按天轮转尚未实现。debug清理为7天；调度日志、bundle、备份和周资源状态没有通用自动五日删除。五日规则只属于HTML日期目录。
+当前文本日志按log_keep保留最近30个文件，不能写成“已保留30天”；按天轮转尚未实现。debug清理为7天，正式诊断只保存截图与JSON、不再新增page.html；既有诊断HTML与历史归档均保留。调度日志、bundle、备份和周资源状态没有通用自动五日删除。五日规则只属于独立HTML日期目录。
 
 完成通知统一由result_notification.py生成：
 
@@ -282,7 +286,7 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 
 固定登记入口：[周报链接登记表](https://wit0jhu6kvu.feishu.cn/wiki/HwxpwCnZ7iV1o5klIGbc8wJHnrd)。
 
-实际字段：序号、飞书链接、更新时间。忽略链接空行，非空行序号须为唯一正整数，选最大值；更新时间不参与排序。链接没更新时仍选择当前周报，但新批次会复制其最新内容。最新链接无权限/无效时停止，不退回旧周。同序号更换URL应停止并要求新序号；正式抓取和缓存恢复均验证。
+实际字段：序号、飞书链接、更新时间。忽略链接空行，非空行序号须为唯一正整数，选最大值；更新时间不参与排序。链接首次发现时间由本机`outputs/weekly_runs/registry_freshness.json`持久记录，正式新批次沿用超过配置上限（默认8天）即停止并要求登记新序号，不能靠每次读取重置年龄。最新链接无权限/无效时停止，不退回旧周；同序号更换URL同样停止。明确恢复既有run_id按其已固化快照执行，不因登记老化破坏恢复。
 
 支持/wiki节点解析及/sheets直链，?sheet只定位页面，不限制全表枚举。允许域名与Token白名单校验先于API调用。登记表永久只读。
 
@@ -292,7 +296,7 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 
 表名在成功发布数据后尝试更新为`Amazon周报前端价格捕捉_{period_id}_{run_id}`；仅基础字段成功更新或空表发布也同步名称。固定身份及weekly manifest一起保留，固定登记缺失时正式抓取/恢复均停止。
 
-周期准备和所有CLI使用OS文件锁，进程退出释放；.locks标记文件仍存在不等于任务运行中，不手工删锁“解锁”。Windows调度和直接CLI具有同一整批互斥，仍不要在计划任务运行时手工重复启动。
+周期准备和所有CLI使用OS文件锁，进程退出释放；.locks标记文件仍存在不等于任务运行中，不手工删锁“解锁”。Windows调度和直接CLI具有同一整批互斥。开机补跑同时命中早晚任务时仅一批取得锁，另一批退出75；调度包装器将其记为“已有批次运行，跳过”并向任务计划程序返回成功，避免假故障和重复全量。每份调度日志文件名含毫秒与PID，互不覆盖。
 
 ## 17. 页面状态与输出
 
@@ -306,7 +310,7 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 | 站点/币种组合错误 | currency_error | 阻断，不换汇、不比较 |
 | 正常售价/目标价等源字段无效 | source_data_invalid | 不抓取，写异常空结果 |
 
-异常商品URL、最终页面URL、状态和原因保存在缓存/bundle；技术错误按配置保留截图或诊断HTML。诊断HTML不等于用户要求的自包含归档。
+异常商品URL、最终页面URL、状态和原因保存在缓存/bundle；技术错误按配置保留截图及JSON诊断，不新增页面HTML。历史诊断HTML继续留存但不再增长。
 
 ## 18. 当前CLI、产物与故障处理
 
@@ -344,6 +348,7 @@ $env:PYTHONPATH='app'
 |---|---|
 | outputs/weekly_runs/fixed_result.json | 固定结果Token、URL和当前发布周期，必须备份 |
 | outputs/weekly_runs/latest_run.json | 最新准备批次身份，防旧周期/旧run发布，必须备份 |
+| outputs/weekly_runs/registry_freshness.json | 登记序号、URL及首次发现时间，正式换周过期门禁，必须备份 |
 | outputs/weekly_runs/{period_id}/weekly_manifest.json | 当前run_id的原表、快照、固定结果、映射及发布状态，必须备份 |
 | outputs/weekly_runs/{period_id}/runs/ | 以前批次完整manifest及逐批链接审计；历史登记不可直接恢复覆盖新批次 |
 | outputs/weekly_runs/active_result.json | 最近完整验收批次索引，不代表最后一次部分写入 |

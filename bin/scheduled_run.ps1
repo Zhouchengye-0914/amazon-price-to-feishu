@@ -4,7 +4,7 @@ $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $schedulerLogRoot = Join-Path $projectRoot 'outputs\scheduler_logs'
 New-Item -ItemType Directory -Force -Path $schedulerLogRoot | Out-Null
 $startedAt = Get-Date
-$logPath = Join-Path $schedulerLogRoot ($startedAt.ToString('yyyy-MM-dd_HHmmss') + '.log')
+$logPath = Join-Path $schedulerLogRoot ($startedAt.ToString('yyyy-MM-dd_HHmmss_fff') + "_$PID.log")
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     "[$($startedAt.ToString('o'))] ERROR: Python not found: $python" | Set-Content -LiteralPath $logPath -Encoding UTF8
     exit 2
@@ -17,5 +17,9 @@ $env:PYTHONIOENCODING = 'utf-8'
 & $python 'app\main.py' '--weekly-run' '--confirm' 2>&1 | Out-File -LiteralPath $logPath -Encoding utf8 -Append
 $exitCode = $LASTEXITCODE
 $finishedAt = Get-Date
+if ($exitCode -eq 75) {
+    "[$($finishedAt.ToString('o'))] SKIPPED overlapping/catch-up task; active run owns the global lock" | Add-Content -LiteralPath $logPath -Encoding UTF8
+    $exitCode = 0
+}
 "[$($finishedAt.ToString('o'))] END exit=$exitCode elapsed_seconds=$([math]::Round(($finishedAt - $startedAt).TotalSeconds, 3))" | Add-Content -LiteralPath $logPath -Encoding UTF8
 exit $exitCode

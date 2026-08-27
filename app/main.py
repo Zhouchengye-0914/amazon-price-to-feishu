@@ -64,6 +64,7 @@ from weekly_mapping import build_discovery, save_discovery, validate_discovery
 from product_links import audit_manifest_links, save_link_audit
 from weekly_execution import price_only_config, ensure_price_week, atomic_json
 from publication_guard import assert_latest_run
+from registry_freshness import assert_registry_fresh
 from runtime_state import exclusive_run, RunBusy
 
 
@@ -1151,6 +1152,10 @@ def weekly_daily_flow(fc: FeishuClient, cfg: dict, sheets: list[str], args, logg
         registry['records'], datetime.now(timezone(timedelta(hours=8))),
         cfg['feishu_allowed_hosts'])
     store = WeeklyAssetStore(OUTPUT_DIR / 'weekly_runs')
+    if not args.dry_run and not args.fetch_only:
+        assert_registry_fresh(
+            store, selection, datetime.now(timezone(timedelta(hours=8))),
+            cfg.get('weekly_registry_max_age_days', 8.0))
     manifest = ensure_price_week(fc, store, selection, registry, cfg,
                                  allow_create=not args.dry_run and not args.fetch_only,
                                  run_id=(run_id := _price_run_id(store, selection.period_id, args)),
@@ -1529,16 +1534,9 @@ def amazon_marketplace_poc_flow(cfg: dict, logger, args) -> None:
     tab = None
     try:
         if not browser.setup(strict_location=True):
-            debug_dir = OUTPUT_DIR / 'debug' / 'r1_7_location'
-            debug_dir.mkdir(parents=True, exist_ok=True)
             p(logger, f'区域设置失败阶段: {browser.location_error} | '
                       f'page={getattr(browser.page, "url", "")} | '
                       f'title={str(getattr(browser.page, "title", ""))[:120]}')
-            try:
-                (debug_dir / f'{marketplace.lower()}_setup.html').write_text(
-                    browser.page.html or '', encoding='utf-8')
-            except Exception:
-                pass
             raise RuntimeError(f'{marketplace} 邮编设置未能回读验证，禁止继续商品抓取')
         tab = browser.acquire()
         result, tab = browser.fetch_with_retry(tab, row, cfg)

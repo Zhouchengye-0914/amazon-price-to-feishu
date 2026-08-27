@@ -123,9 +123,12 @@ def sync_weekly_result_base(fc, store: WeeklyAssetStore, period_id: str,
     manifest['business_ready'] = False
     store.save(period_id, manifest)
 
+    target_metadata = fc.query_sheets(result_token)
     existing = {item.get('title'): item.get('sheet_id')
-                for item in fc.query_sheets(result_token)
+                for item in target_metadata
                 if item.get('title') and item.get('sheet_id')}
+    capacities = {item.get('sheet_id'): (item.get('grid_properties') or {}).get('row_count')
+                  for item in target_metadata}
     summaries = []
     for index, plan in enumerate(plans):
         mapping = plan['mapping']
@@ -136,7 +139,8 @@ def sync_weekly_result_base(fc, store: WeeklyAssetStore, period_id: str,
             existing[title] = sheet_id
 
         backup = fc.backup_target_sheet(result_token, title, sheet_id, run_id)
-        old = fc.read_values(result_token, sheet_id, 'A3:A2000')
+        old = read_rows(fc, result_token, sheet_id, last='A', start=3,
+                        row_count=capacities.get(sheet_id))
         old_last = 2 + len(old)
         clear_last = max(old_last, 2 + len(plan['values']))
         fc.write_values(result_token, sheet_id, 'A2:P2', [RESULT_HEADERS + ['']])
@@ -339,6 +343,9 @@ def write_weekly_result_columns(fc, manifest: dict, run_id: str,
     if not manifest.get('business_ready'):
         raise RuntimeError('本周结果表尚未完成 A:G 初始化')
     mappings = {item['result_sheet']: item for item in manifest.get('sheet_mappings') or []}
+    target_metadata = fc.query_sheets(result_token)
+    capacities = {item.get('sheet_id'): (item.get('grid_properties') or {}).get('row_count')
+                  for item in target_metadata}
     plans = []
     blocked = []
     migrations = []
@@ -355,7 +362,8 @@ def write_weekly_result_columns(fc, manifest: dict, run_id: str,
             migrations.append((sheet, sheet_id))
         elif not header or header[0][:15] != RESULT_HEADERS or any(header[0][15:]):
             raise RuntimeError(f'[{sheet}] A:O 布局预检失败')
-        asin_values = fc.read_values(result_token, sheet_id, 'A3:A2000')
+        asin_values = read_rows(fc, result_token, sheet_id, last='A', start=3,
+                                row_count=capacities.get(sheet_id))
         asin_map = {}
         for offset, value in enumerate(asin_values, start=3):
             asin = str(value[0] if value else '').strip()
@@ -402,7 +410,8 @@ def write_weekly_result_columns(fc, manifest: dict, run_id: str,
         try:
             fc.backup_target_sheet(result_token, sheet, sheet_id, run_id)
             if sheet in migration_sheets:
-                old = fc.read_values(result_token, sheet_id, 'N2:P2000')
+                old = read_rows(fc, result_token, sheet_id, first='N', last='P', start=2,
+                                row_count=capacities.get(sheet_id))
                 if not old or old[0][:3] != ['HTML链接', '币种', 'Amazon链接']:
                     raise RuntimeError(f'[{sheet}] 迁移前N:P表头已变化')
                 shifted = []

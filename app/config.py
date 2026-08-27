@@ -57,6 +57,7 @@ DEFAULTS = {
     'feishu_target_wiki': 'https://wit0jhu6kvu.feishu.cn/wiki/JbiQwDZXeiJan0k8ydRczfWNnFc',
     'weekly_registry_url': 'https://wit0jhu6kvu.feishu.cn/wiki/HwxpwCnZ7iV1o5klIGbc8wJHnrd',
     'weekly_registry_sheet_id': 'c1fcd1',  # 2026-08-24 R1.1 只读发现：Sheet1
+    'weekly_registry_max_age_days': 8.0,
     'feishu_allowed_hosts': ['wit0jhu6kvu.feishu.cn'],
     'feishu_app_id': 'cli_aa097133e3355ccd',
     'feishu_app_secret': '',          # 仅由根目录 .env 或环境变量 FS_APP_SECRET 注入
@@ -107,6 +108,7 @@ _NUM_FIELDS = {
     'price_tolerance': (str, '0', '10'),
     'ambiguous_price_ratio': (str, '0', '1'),
     'cache_max_age_hours': (float, 0.5, 720),
+    'weekly_registry_max_age_days': (float, 1, 31),
     'max_error_ratio_for_push': (float, 0, 1),
     'max_target_fallback_ratio_for_push': (float, 0, 1),
     'log_keep': (int, 1, 365),

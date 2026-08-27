@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""diagnostics.py — 异常页证据保存（crawl_error/parse_error/captcha）"""
+"""异常页轻量证据：截图和JSON；不保存页面HTML。"""
 from __future__ import annotations
 
 import io
@@ -11,19 +11,13 @@ from models import CrawlResult
 
 
 def save_evidence(run_id: str, sheet: str, cr: CrawlResult, tab, cfg: dict) -> Path | None:
-    """保存截图 + HTML + 诊断 JSON，目录 outputs/debug/{run_id}/{sheet}/{asin}/"""
+    """保存截图和诊断JSON；既有page.html保留但不再新增。"""
     if cr.status.value not in ('crawl_error', 'parse_error'):
         return None
     d = DEBUG_DIR / run_id / sheet / cr.asin
     d.mkdir(parents=True, exist_ok=True)
     try:
         tab.get_screenshot(path=str(d / 'screenshot.png'))
-    except Exception:
-        pass
-    try:
-        html = tab.html
-        if html:
-            (d / 'page.html').write_text(html, encoding='utf-8', errors='replace')
     except Exception:
         pass
     diag = {

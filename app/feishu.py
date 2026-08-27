@@ -732,8 +732,12 @@ class FeishuClient:
 
     def build_asin_map(self, spreadsheet: str, sheet_id: str) -> dict[str, int]:
         """读 A 列定位 ASIN 行（数据从表头行+1 开始，表头自动探测）"""
+        from sheet_io import read_rows
         hr = self._target_header_row(spreadsheet, sheet_id, self.cfg)
-        vals = self.read_values(spreadsheet, sheet_id, f'A{hr + 1}:A2000')
+        info = next((item for item in self.query_sheets(spreadsheet)
+                     if item.get('sheet_id') == sheet_id), {})
+        vals = read_rows(self, spreadsheet, sheet_id, last='A', start=hr + 1,
+                         row_count=(info.get('grid_properties') or {}).get('row_count'))
         m: dict[str, int] = {}
         for i, cell in enumerate(vals):
             v = (cell[0] if isinstance(cell, list) and cell else cell) or ''
@@ -749,17 +753,22 @@ class FeishuClient:
         表头自动探测 + 列名定位（兼容不同 Sheet 布局，如 PD05 目标价在 L 列）。
         3.6 I 列按百分比语义解析（'20%' → 0.20）。
         3.7 目标成交价/正常售价为空 → 无效行，不进入正式抓取。"""
-        rng = 'A1:O500'
+        from sheet_io import read_rows
         out: dict[str, list[ReportRow]] = {}
         invalid_all: list[dict] = []
         meta = {'spreadsheet': spreadsheet, 'read_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'sheets': {}}
         sheet_map = self.list_sheets(spreadsheet)
+        metadata = {item.get('sheet_id'): item for item in self.query_sheets(spreadsheet)}
         for sheet in sheets:
             sid = sheet_map.get(sheet)
             if not sid:
                 continue
-            vals = self.read_values(spreadsheet, sid, rng)
+            info = metadata.get(sid) or {}
+            grid = info.get('grid_properties') or {}
+            vals = read_rows(self, spreadsheet, sid,
+                             last=col_letter(max(15, int(grid.get('column_count') or 15))),
+                             row_count=grid.get('row_count'))
             try:
                 rows, invalid = read_source_rows(vals, cfg)
             except RuntimeError as e:

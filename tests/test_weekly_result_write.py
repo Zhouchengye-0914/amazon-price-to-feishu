@@ -21,10 +21,17 @@ class FakeFeishu:
 
     def read_values(self, token, sid, rng):
         if rng == 'A2:P2': return [self.header]
-        if rng == 'A3:A2000': return [[asin] for asin in self.asins]
-        if rng == 'N2:P2000': return [['HTML链接', '币种', 'Amazon链接'], ['file:///old.html', 'CAD', 'https://www.amazon.ca/dp/B000000001']]
+        single = re.fullmatch(r'A(\d+):A(\d+)', rng)
+        if single:
+            start, end = map(int, single.groups())
+            return [[asin] for asin in self.asins[max(0, start - 3):max(0, end - 2)]]
         if rng.startswith('N2:P') and self.migrated is not None:
             return self.migrated
+        legacy = re.fullmatch(r'N(\d+):P(\d+)', rng)
+        if legacy:
+            values = [['HTML链接', '币种', 'Amazon链接'], ['file:///old.html', 'CAD', 'https://www.amazon.ca/dp/B000000001']]
+            start, end = map(int, legacy.groups())
+            return values[max(0, start - 2):max(0, end - 1)]
         match = re.fullmatch(r'A(\d+):([AO])(\d+)', rng)
         if match:
             start, col, end = match.groups()
@@ -45,6 +52,12 @@ class FakeFeishu:
     def backup_target_sheet(self, *args):
         if args not in self.backups:
             self.backups.append(args)
+
+    def query_sheets(self, token):
+        return [{'title': 'PD03', 'sheet_id': 'sid',
+                 'grid_properties': {'row_count': max(3, len(self.asins) + 2), 'column_count': 16}},
+                {'title': 'PD17', 'sheet_id': 's2',
+                 'grid_properties': {'row_count': max(3, len(self.asins) + 2), 'column_count': 16}}]
 
 
 def manifest():
@@ -174,7 +187,7 @@ class WeeklyResultWriteTest(unittest.TestCase):
         read = fc.read_values
         def rich(token, sid, rng):
             values = read(token, sid, rng)
-            if rng == 'N2:P2000':
+            if re.fullmatch(r'N2:P\d+', rng):
                 values[1][2] = [{'type': 'url', 'text': 'Amazon', 'link': 'https://www.amazon.ca/dp/B000000001'}]
             return values
         fc.read_values = rich
