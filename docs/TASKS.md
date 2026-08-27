@@ -9,7 +9,7 @@
 - [x] 新增5项针对性回归并完成253/253离线测试；覆盖登记过期与不可续期、诊断不写HTML、2003行ASIN写入和调度重叠语义。测试均使用临时目录与替身，未抓Amazon、未写飞书。
 - [x] 暂存与生产验证：253/253通过（暂存墙钟2.675秒、生产墙钟2.135秒）；60份Python AST、8份入口文档链接、scheduled_run.ps1与schedule.ps1语法、固定容量/HTML落盘残留扫描及git diff --check均通过。全部使用替身，未抓Amazon、未写飞书。
 - [x] 生产部署：只读确认两个价格任务Ready、HTML任务Disabled，仅有两个无关BDLD端口服务；取得weekly_scheduler.lock后部署16份文件，逐文件SHA-256一致。旧文件备份于outputs/code_backups/final_production_closeout_20260827，历史HTML/debug及用户.workbuddy修改均未改动。
-- [ ] 完成Git提交与远端推送；完成后在本节补充提交证据。
+- [x] Git版本控制：生产代码提交`f9f5b86`（Complete production delivery safeguards），已推送`production-closeout-20260827`并将`fix-codescan-20260826`快进至同一提交；最终证据文档另作后续提交。
 - [ ] 下一次真实工作日计划批次作为最终在线验收：记录隐藏启动、登记时效、CA结果、固定表写后回读、通知和完整墙钟；不为收口提前触发额外全量。
 
 ## 当前执行索引：生产全量后收口（2026-08-27）
