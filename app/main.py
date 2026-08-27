@@ -312,7 +312,7 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
                                 proxy=cfg.get('proxy') or None,
                                 tabs=workers, marketplace=marketplace,
                                 postal_code=postal_code)
-        archive_enabled = bool(cfg.get('html_archive_enabled', True))
+        archive_enabled = bool(cfg.get('html_archive_enabled', False))
         storage = None
         archiver = None
         item_orders = {row.asin: index for index, row in enumerate(rows, start=1)}
@@ -426,7 +426,7 @@ def run_fetch(run_id: str, sheet: str, rows: list[ReportRow], cfg: dict,
         save_sheet_cache(run_id, sheet, rows, crawls, cfg)
     except Exception as exc:
         logger.error(f'[最终缓存保存失败] {sheet}: {exc}；保留采集结果供weekly bundle持久化')
-    if cfg.get('html_archive_enabled', True):
+    if cfg.get('html_archive_enabled', False):
         storage = ArchiveStorage(cfg['html_archive_root'], cfg['html_retention_days'],
                                  cfg['html_min_free_gb'], cfg.get('_html_server_base_url', ''))
         run_date = datetime.now().date()
@@ -1417,7 +1417,7 @@ def _load_weekly_push_results(run_id: str, sheets: list[str], manifest: dict,
         for cr in crawls:
             if cr.run_id != run_id:
                 raise RuntimeError(f'[{sheet}] {cr.asin} 缓存 run_id 不匹配')
-            if cfg is not None and not cfg.get('html_archive_enabled', True):
+            if cfg is not None and not cfg.get('html_archive_enabled', False):
                 continue
             if cr.status in (PageStatus.OK, PageStatus.SOLD_OUT,
                              PageStatus.PAGE_NOT_FOUND):
@@ -1433,7 +1433,7 @@ def _load_weekly_push_results(run_id: str, sheets: list[str], manifest: dict,
                     cr.archive_error = 'html_sha256_mismatch'
                     cr.html_url = ''
                     continue
-                if cfg and cfg.get('html_server_enabled', True):
+                if cfg and cfg.get('html_server_enabled', False):
                     from html_server import archive_http_url, server_status
                     cr.html_url = archive_http_url(path, cfg, server_status(cfg))
     if not results:

@@ -16,7 +16,7 @@
   "html_min_free_gb": 40.0,
   "html_archive_required": false,
   "html_archive_enabled": false,
-  "html_server_enabled": true,
+  "html_server_enabled": false,
   "html_server_bind": "0.0.0.0",
   "html_server_port": 8765,
   "feishu_manager_open_id": "ou_68e7d2af96255c1eeb1eea8021c80ea4",

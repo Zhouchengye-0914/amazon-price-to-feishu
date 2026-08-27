@@ -47,7 +47,7 @@ def load_state() -> dict:
 def server_status(cfg: dict, timeout: float = 1.5) -> dict:
     state = load_state()
     expected_root = str(Path(cfg['html_archive_root']).resolve())
-    result = {**state, 'enabled': bool(cfg.get('html_server_enabled', True)),
+    result = {**state, 'enabled': bool(cfg.get('html_server_enabled', False)),
               'reachable': False}
     if not result['enabled']:
         result['reason'] = 'disabled'

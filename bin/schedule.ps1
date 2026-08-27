@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$runner = Join-Path $projectRoot 'bin\scheduled_run.bat'
+$runner = Join-Path $projectRoot 'bin\scheduled_run.ps1'
 
 if ($Action -eq '--remove') {
     & schtasks.exe /Delete /TN AmazonDaily_0730 /F
@@ -17,7 +17,14 @@ if ($Action -eq '--remove') {
 # HTML service and firewall are managed separately; price install/remove must
 # not start, stop, or grant network access for that optional service.
 # Current production schedule: weekdays at 07:30 and 15:30, no expiration.
-& schtasks.exe /Create /TN AmazonDaily_0730 /TR $runner /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 07:30 /F
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& schtasks.exe /Create /TN AmazonDaily_1530 /TR $runner /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 15:30 /F
-exit $LASTEXITCODE
+# PowerShell is launched hidden directly, so no cmd/console window can be closed
+# accidentally while the browser runs headless in the background.
+$taskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runner)
+$settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+foreach ($item in @(@('AmazonDaily_0730', 7, 30), @('AmazonDaily_1530', 15, 30))) {
+    $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At (
+        Get-Date -Hour $item[1] -Minute $item[2] -Second 0)
+    Register-ScheduledTask -TaskName $item[0] -Action $taskAction -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+}

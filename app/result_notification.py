@@ -1,11 +1,28 @@
 """Shared completion-message formatting; no filesystem or network side effects."""
 from __future__ import annotations
 
+from datetime import datetime
+
 INSTRUCTIONS_URL = 'https://wit0jhu6kvu.feishu.cn/wiki/G531wP7WNiepV3krnrHcavqin6d'
 
 
+def display_period(period_id: str, run_id: str) -> str:
+    """Human week label derived from the immutable run date.
+
+    The registry sequence remains in manifests for identity/audit, while users
+    see the actual ISO week and are no longer left with a misleading seq-2.
+    """
+    try:
+        day = datetime.strptime(str(run_id)[:8], '%Y%m%d').date()
+        year, week, _ = day.isocalendar()
+        return f'{year}-W{week:02d}（登记序号 {period_id}）'
+    except (TypeError, ValueError):
+        return str(period_id)
+
+
 def result_title(period_id: str, run_id: str) -> str:
-    return f'Amazon周报前端价格捕捉_{period_id}_{run_id}'
+    week = display_period(period_id, run_id).split('（', 1)[0]
+    return f'Amazon周报前端价格捕捉_{week}_{run_id}'
 
 
 def completion_text(*, period_id: str, run_id: str, started_at: str,
@@ -18,7 +35,7 @@ def completion_text(*, period_id: str, run_id: str, started_at: str,
         '',
         'Amazon 周报前端价格捕捉任务',
         '',
-        f'周期：{period_id}', f'运行编号：{run_id}',
+        f'周期：{display_period(period_id, run_id)}', f'运行编号：{run_id}',
         f'开始：{started_at.replace("T", " ")}', f'结束：{finished_at.replace("T", " ")}',
         f'完整耗时：{int(elapsed_seconds) // 60}分{int(elapsed_seconds) % 60:02d}秒',
         '',

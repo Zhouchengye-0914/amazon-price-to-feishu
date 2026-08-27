@@ -20,6 +20,7 @@ class ResultNotificationTest(unittest.TestCase):
         self.assertNotIn('HTML局域网端口', text)
         self.assertNotIn('证据:', text)
         self.assertNotIn('需恢复', text)
+        self.assertIn('周期：2026-W35（登记序号 seq-2）', text)
 
     def test_local_data_only_for_manager_and_rich_links(self):
         fc = Mock()
@@ -60,6 +61,26 @@ class ResultNotificationTest(unittest.TestCase):
         second = result_title('seq-2', '20260826_153000')
         self.assertNotEqual(first, second)
         self.assertTrue(first.endswith('20260826_070010'))
+        self.assertIn('2026-W35', first)
+
+    def test_expired_token_is_refreshed_before_final_notification(self):
+        import httpx
+        from feishu import FeishuClient
+        fc = FeishuClient({'feishu_app_id': 'app', 'feishu_app_secret': 'secret'})
+        fc.token = 'expired'
+        fc._token_expires_at = 1
+        calls = []
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json={
+                'code': 0, 'tenant_access_token': 'fresh', 'expire': 7200})
+        fc._client.close()
+        fc._client = httpx.Client(base_url='https://open.feishu.cn/open-apis', transport=httpx.MockTransport(handler))
+        self.addCleanup(fc._client.close)
+        from unittest import mock
+        with mock.patch('feishu.time.monotonic', return_value=100):
+            self.assertEqual(fc.auth(), 'fresh')
+        self.assertEqual(len(calls), 1)
 
     def test_application_collaborators_api_and_delivery_error(self):
         import httpx

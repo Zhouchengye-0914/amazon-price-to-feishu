@@ -10,10 +10,11 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     exit 2
 }
 Set-Location -LiteralPath $projectRoot
+$env:PYTHONIOENCODING = 'utf-8'
 # Python owns outputs/weekly_scheduler.lock for ALL CLI entrypoints.
 # Do not acquire the same lock twice (parent PowerShell + child Python).
 "[$($startedAt.ToString('o'))] START weekly-run --confirm" | Set-Content -LiteralPath $logPath -Encoding UTF8
-& $python 'app\main.py' '--weekly-run' '--confirm' *>> $logPath
+& $python 'app\main.py' '--weekly-run' '--confirm' 2>&1 | Out-File -LiteralPath $logPath -Encoding utf8 -Append
 $exitCode = $LASTEXITCODE
 $finishedAt = Get-Date
 "[$($finishedAt.ToString('o'))] END exit=$exitCode elapsed_seconds=$([math]::Round(($finishedAt - $startedAt).TotalSeconds, 3))" | Add-Content -LiteralPath $logPath -Encoding UTF8

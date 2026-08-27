@@ -245,6 +245,7 @@ class FeishuClient:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.token = ''
+        self._token_expires_at = 0.0
         self._client = httpx.Client(
             base_url=FEISHU_BASE,
             timeout=httpx.Timeout(20, connect=15),
@@ -253,7 +254,10 @@ class FeishuClient:
 
     # ---------- 认证与解析 ----------
     def auth(self) -> str:
-        if self.token:
+        # Refresh proactively. A client lives for more than an hour during a full
+        # run; caching a tenant token forever makes the final notification fail.
+        expires_at = getattr(self, '_token_expires_at', 0.0)
+        if self.token and (expires_at <= 0 or time.monotonic() < expires_at):
             return self.token
         r = self._client.post('/auth/v3/tenant_access_token/internal', json={
             'app_id': self.cfg['feishu_app_id'],
@@ -264,6 +268,8 @@ class FeishuClient:
         if d.get('code') != 0:
             raise RuntimeError(f"飞书认证失败: {d.get('msg')}")
         self.token = d['tenant_access_token']
+        expires_in = max(0, int(d.get('expire') or d.get('expires_in') or 7200))
+        self._token_expires_at = time.monotonic() + max(0, expires_in - 300)
         return self.token
 
     def _headers(self) -> dict:

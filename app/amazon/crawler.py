@@ -454,10 +454,15 @@ class AmazonBrowser:
                     if cooldown > 0:
                         self._sleep(cooldown)
                 if attempts <= cfg['retry']:
+                    # Navigation/driver failures often leave the tab displaying
+                    # the preceding ASIN. Reusing it caused bursts of false
+                    # identity_mismatch, especially on the slower CA site.
+                    tab = self.rebuild(tab)
                     continue
                 break
             if st == PageStatus.PARSE_ERROR:
                 if attempts == 1:
+                    tab = self.rebuild(tab)
                     continue
                 break
             break

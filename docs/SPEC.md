@@ -10,7 +10,7 @@
 
 从固定链接登记表选择最新周报，每次新的正式批次都复制该周报的最新内容作为本批只读完整快照，重新发现业务子表、提取A:G并抓取Amazon实时价格，最后写入同一个固定结果Spreadsheet。固定的是字段位置和结果链接，不是A:G的数据。明确恢复已有run_id时才复用原批快照，禁止混用新基础数据和旧价格。
 
-价格任务与HTML独立：正式 `--weekly-run` 和 `--weekly-push-only` 强制关闭运行副本配置中的HTML捕获、HTML必需门禁和HTML服务依赖；不修改独立HTML配置，不删除既有文件，不启动或关闭端口。禁止使用旧HTML替代实时价格。
+价格任务与HTML独立：正式 `--weekly-run` 和 `--weekly-push-only` 强制关闭HTML捕获、HTML必需门禁和HTML服务依赖；默认配置、实际配置及模板均关闭归档与服务。既有HTML只读留存，不清理、不改名、不提交Git；8765服务和自启动任务停用。代码与手工脚本保留，日后如要恢复必须作为独立功能重新验收。禁止使用旧HTML替代实时价格。
 
 ### 1.1 端到端流程图
 
@@ -198,7 +198,7 @@ latest_run.json记录最新准备批次（period、run、快照和固定结果To
 
 每个CLI入口（人工、定时、恢复及维护）由Python持有同一个outputs/weekly_scheduler.lock，覆盖准备、抓取、发布、通知全过程。PowerShell仅负责启动与日志，不重复占锁；已有任务时第二个入口以75退出，不改变云端状态。锁文件残留不代表进程仍存活，OS释放锁后可重启。
 
-每个商品完成或失败后等待随机1～3秒再释放Tab，HTML关闭也执行；HTML开启时归档结束后只等待一次。复用post_archive_delay_min/max配置及post_archive_delay_seconds日志字段，不增加另一组重复配置。
+每个商品完成或失败后等待随机1～3秒再释放Tab，HTML关闭也执行；HTML开启时归档结束后只等待一次。复用post_archive_delay_min/max配置及post_archive_delay_seconds日志字段，不增加另一组重复配置。导航、身份或解析失败需要重试时必须关闭并重建当前Tab，不能让下一次请求继承上一商品页面；重建后的Tab仍由同一worker独占并最终归还池。
 
 导航、文档/价格等待、页面脚本读取和稳定等待按剩余deadline裁剪；禁用导航内部重试，重试只由外层统一执行，每次直接重新导航，不插入额外无预算refresh/rebuild。返回成功前复查截止时间，超时清除价格并标记deadline_exceeded。初始化首页timeout为30秒（不是30000秒）。商品间1～3秒等待不计入90秒抓取预算；浏览器驱动/操作系统失去响应仍不是进程级强制终止保障，不能宣称任何环境下墙钟严格90秒。
 
@@ -238,7 +238,7 @@ ASIN提取支持纯编号、普通URL、飞书富文本链接及HYPERLINK公式�
 
 本机文件URL仅指向已存在、位于归档根内的普通.html；URI编码正确，不伪造下载未完成的链接。
 
-独立局域网服务代码及脚本保留，默认8765端口、只读访问归档根；开关及防火墙由独立操作管理。价格调度安装/移除不操作HTML服务。当前结果表和完成通知均不输出HTML链接或端口状态。不得据此自动开放公网、安装隧道或修改防火墙。
+独立局域网服务代码及脚本保留但默认关闭；历史默认端口为8765，只读访问归档根。当前自启动任务禁用、监听进程停止、防火墙允许规则保持禁用，既有HTML不删除。价格调度安装/移除不重新开启HTML服务。当前结果表和完成通知均不输出HTML链接或端口状态。不得据此自动开放公网、安装隧道或修改防火墙。
 
 ## 13. 日志、恢复证据与通知
 
@@ -257,6 +257,7 @@ ASIN提取支持纯编号、普通URL、飞书富文本链接及HYPERLINK公式�
 - 首行：Hi，有个任务完成请查收.
 - 标题：Amazon 周报前端价格捕捉任务
 - 分组展示周期、run_id、起止时间、耗时、子表数、写入/阻断数；正式抓取含技术异常率。
+- 周期对人显示为run_id日期对应的ISO周（例如2026-W35），并附内部登记序号用于追溯；内部manifest仍使用登记表序号，不能只改通知文字伪造换周。结果表名称同样使用ISO周和run_id。
 - 结果表使用实际名称与固定可点击链接；说明文档为[关于上述表格的简要说明](https://wit0jhu6kvu.feishu.cn/wiki/G531wP7WNiepV3krnrHcavqin6d)。
 - 不含HTML端口行、证据字样或模拟声明；不能使用虚构数据冒充已执行。
 - “本地数据”路径只对feishu_manager_open_id配置的周成业可见；其他人移除整行。
@@ -291,7 +292,7 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 
 表名在成功发布数据后尝试更新为`Amazon周报前端价格捕捉_{period_id}_{run_id}`；仅基础字段成功更新或空表发布也同步名称。固定身份及weekly manifest一起保留，固定登记缺失时正式抓取/恢复均停止。
 
-周期准备使用OS文件锁，进程退出释放；.locks标记文件仍存在不等于任务运行中，不手工删锁“解锁”。Windows调度入口另有整批锁；直接CLI不具有同等整批互斥保证，不与正在运行的计划任务并行手动启动。
+周期准备和所有CLI使用OS文件锁，进程退出释放；.locks标记文件仍存在不等于任务运行中，不手工删锁“解锁”。Windows调度和直接CLI具有同一整批互斥，仍不要在计划任务运行时手工重复启动。
 
 ## 17. 页面状态与输出
 
@@ -375,9 +376,9 @@ $env:PYTHONPATH='app'
 
 ### 19.2 每天两次
 
-当前Windows任务AmazonDaily_0730、AmazonDaily_1530均启用，每周一至周五分别07:30和15:30，WeeksInterval=1，EndBoundary为空，无8月31日截止。统一执行bin/scheduled_run.bat → scheduled_run.ps1 → app/main.py --weekly-run --confirm。
+当前Windows任务AmazonDaily_0730、AmazonDaily_1530均启用，每周一至周五分别07:30和15:30，WeeksInterval=1，EndBoundary为空，无8月31日截止。任务直接以隐藏PowerShell执行bin/scheduled_run.ps1 → app/main.py --weekly-run --confirm，不经过可见的bat/cmd窗口。
 
-当前账号为Interactive：需电脑开机且账号已登录；不需GPT窗口。StartWhenAvailable=false，错过时段不自动补跑。入口整批锁防重叠，日志保存开始/结束及退出码。安装脚本bin/schedule.ps1创建这两条工作日任务；不操作HTML服务或防火墙。不要另装重复调度器。
+当前账号为Interactive：需电脑开机且账号已登录；不需GPT窗口。任务Hidden=true、PowerShell WindowStyle=Hidden，用户不能因关闭控制台误停；StartWhenAvailable=true，开机或恢复后补触发错过时段，入口整批锁与IgnoreNew共同防重叠。日志使用UTF-8保存开始/结束及退出码。安装脚本bin/schedule.ps1创建这两条工作日任务；不操作HTML服务或防火墙。不要另装重复调度器。
 
 单次历史07:00任务不是长期规则；本次文档审查不删除或修改其他Windows任务。
 

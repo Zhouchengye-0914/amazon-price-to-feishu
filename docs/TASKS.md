@@ -1,5 +1,16 @@
 # TASKS: Amazon Daily
 
+## 当前执行索引：生产全量后收口（2026-08-27）
+
+- [x] 核对真实批次20260827_073003：调度07:30:01启动、08:36:38结束，完整墙钟3997.270秒；724行中542写入、182阻断，8名协作者通知均成功。内部登记和固定结果指针均为seq-2；登记表只读预检发现199行中只有2条有效链接，当前确为序号2，不是通知模板硬编码。
+- [x] 周期可读性：内部seq-N继续作为不可变资源身份；通知“周期”和结果表名称改用run_id日期对应ISO周并附登记序号，例如2026-W35（登记序号seq-2）。不修改历史manifest，不用显示文字冒充登记表新增链接。
+- [x] CA分析：170行=28成功、116 crawl_error、17 parse_error、9源数据无效；116条crawl_error主要为identity_mismatch，多个1～3秒失败落到同一上一页ASIN。重试前改为销毁并重建当前Tab，修复后仍保留URL/#ASIN/邮编/域名/币种门禁；出口和风控待在线验证。
+- [x] 飞书token：tenant token不再永久缓存，读取expire/expires_in并提前5分钟刷新，保证长任务结束时通知可重新认证；增加过期token回归。
+- [x] HTML正式停用：代码默认、config.json和模板的归档/必需门禁/服务均为false；价格入口仍强制false。2026-08-27停用AmazonDaily_HTML_Server、停止PID 30284/32068，回查8765监听0、防火墙允许规则Disabled、htmls目录仍存在；不删除历史文件或独立工具。
+- [x] 隐藏调度：安装脚本改为直接启动隐藏、NonInteractive PowerShell，调度日志统一UTF-8并保留原生退出码。首次安装实测暴露PowerShell参数Action与局部变量action大小写冲突，旧任务未被覆盖；已改为taskAction并重新安装。最终回读两任务Ready/Enabled、Hidden=true、Execute=powershell.exe、WindowStyle Hidden、StartWhenAvailable=true、IgnoreNew、DaysOfWeek=62、EndBoundary=null，工作日07:30/15:30不变，未立即运行。
+- [x] 验证与部署：暂存248/248通过（框架1.232秒、命令墙钟1.977秒），58份Python AST、8份入口文档链接和两份PowerShell语法检查通过。部署18份文件并逐文件SHA256核对，备份outputs/code_backups/production_closeout_20260827；正式目录248/248通过（框架1.393秒、命令墙钟2.256秒），git diff --check通过。所有测试使用替身，未抓Amazon或写飞书。
+- [ ] 修复后的首次CA在线样本、15:30全量、ISO周通知/改名和隐藏调度实际验收；必须记录run_id、行数和完整耗时，不用离线测试替代。
+
 ## 当前执行索引：完整优化与缺口收口（2026-08-26，v4）
 
 本节覆盖下方旧版v3与212项测试记录。以下为本轮完整清单；已完成表示代码及离线回归完成，不替代真实云端验收。

@@ -110,7 +110,7 @@ def save_sheet_cache(run_id: str, sheet: str, rows: list[ReportRow],
         'price_tolerance': str(cfg['price_tolerance']),
         'marketplaces': sorted({r.marketplace for r in rows if r.marketplace}),
         'currency_codes': sorted({c.currency_code for c in crawls if c.currency_code}),
-        'html_archive_enabled': bool(cfg.get('html_archive_enabled', True)),
+        'html_archive_enabled': bool(cfg.get('html_archive_enabled', False)),
         'html_archive_required': bool(cfg.get('html_archive_required', True)),
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'records': {c.asin: c.as_dict() for c in crawls},
@@ -146,7 +146,7 @@ def is_cache_valid(meta: dict | None, cfg: dict, sheet: str,
         return False
     if sorted(meta.get('marketplaces') or []) != sorted({r.marketplace for r in rows if r.marketplace}):
         return False
-    archive_enabled = bool(cfg.get('html_archive_enabled', True))
+    archive_enabled = bool(cfg.get('html_archive_enabled', False))
     if bool(meta.get('html_archive_enabled')) != archive_enabled:
         return False
     if archive_enabled:

@@ -90,8 +90,8 @@ class TestTabPool(unittest.TestCase):
                 mock.patch('amazon.crawler.random.uniform', return_value=90):
             result, returned_tab = b.fetch_with_retry(tab, row, cfg)
         self.assertEqual(result.status, PageStatus.OK)
-        self.assertEqual(returned_tab, tab)
-        b.rebuild.assert_not_called()
+        self.assertEqual(returned_tab, rebuilt)
+        b.rebuild.assert_called_once_with(tab)
         # 随机值 90 秒，但 deadline 只剩 70 秒，因此等待必须被总预算截断。
         b._sleep.assert_called_once_with(70)
 
