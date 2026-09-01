@@ -7,6 +7,7 @@
 - [x] 隐藏终端兼容：`scheduled_run.bat`、`start_html_server.bat`补充`-NonInteractive -WindowStyle Hidden`；计划任务仍为隐藏 PowerShell 直接执行，手工启动中心保持可见。
 - [x] 只读复现命令未抓Amazon、未写飞书，确认错误为`RuntimeError: 存在未知 Marketplace 的含 ASIN 子表: Sheet20`。
 - [x] 修复后只读映射验收：当前seq-3快照共20张表，映射18张（US=11、CA=7），`BI源数据`与`Sheet20`共2张辅助表排除；命令耗时13.578秒，未抓Amazon、未写飞书。
+- [x] 版本交付：修复提交`0d4474d`已推送`fix-codescan-20260826`与`production-closeout-20260827`；生产工作区仅保留用户既有`.workbuddy`修改及未纳入本次交付的Docker草稿文件。
 - [ ] 修复后的正式批次需验证20张源表中18张价格业务表被映射、Sheet20被排除，CA结果、固定结果写入、通知和完整耗时；不以只读复现替代线上验收。
 
 ## 当前执行索引：生产级最终收口（2026-08-27）
