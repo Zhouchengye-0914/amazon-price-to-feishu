@@ -42,7 +42,20 @@ def col_letter(number: int) -> str:
 
 
 def classify_sheet(title: str, has_asin: bool,
-                   has_content: bool = True) -> tuple[str, str]:
+                   has_content: bool = True,
+                   headers: list[str] | None = None) -> tuple[str, str]:
+    """Classify a source tab without mistaking generic auxiliary ASIN tabs for price tabs.
+
+    Weekly workbooks commonly contain a generic ``Sheet20`` sales/export tab with an
+    ASIN column.  It is not a price-capture business tab unless it also has the
+    price/target headers used by PD/CPD tabs.  Unknown named ASIN tabs remain a hard
+    failure so a genuinely new business tab cannot be silently skipped.
+    """
+    normalized_headers = {str(item or '').strip() for item in (headers or [])}
+    price_headers = {'正常售价', '目标成交价'}
+    generic_auxiliary = bool(re.fullmatch(r'Sheet\d+', title.strip(), re.IGNORECASE))
+    if generic_auxiliary and has_asin and not price_headers.issubset(normalized_headers):
+        return 'excluded', 'generic_auxiliary_asin_sheet'
     if title.strip().upper().startswith('BI'):
         return 'excluded', 'explicit_auxiliary_bi_source'
     if CA_SHEET_RE.match(title):
@@ -83,7 +96,8 @@ def build_discovery(fc, snapshot_token: str) -> dict:
         located = find_asin_header(values)
         has_content = any(cell_text(cell) for row in values for cell in row)
         marketplace, reason = classify_sheet(
-            sheet.get('title') or '', bool(located), has_content)
+            sheet.get('title') or '', bool(located), has_content,
+            ([cell_text(v) for v in values[located[0] - 1]] if located else []))
         header_row = located[0] if located else None
         asin_col = located[1] if located else None
         header_values = []

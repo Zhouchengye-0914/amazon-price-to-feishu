@@ -1,5 +1,14 @@
 # TASKS: Amazon Daily
 
+## 当前执行索引：9月1日兼容性修复（2026-09-01）
+
+- [x] 复现并定位今日失败：新周报新增`Sheet20`销售/导出辅助表，因含ASIN但无价格业务表头被旧规则误判为未知Marketplace，导致快照完成后在映射阶段退出；新增通用辅助表识别，仅当缺少“正常售价/目标成交价”时排除，具备价格表头的未知命名仍阻断。
+- [x] 异常可诊断性：正式入口异常处理现在先将完整 traceback 写入 `outputs/logs/run_*.log`，再发送管理员通知，避免只留下成功通知的一行日志。
+- [x] 隐藏终端兼容：`scheduled_run.bat`、`start_html_server.bat`补充`-NonInteractive -WindowStyle Hidden`；计划任务仍为隐藏 PowerShell 直接执行，手工启动中心保持可见。
+- [x] 只读复现命令未抓Amazon、未写飞书，确认错误为`RuntimeError: 存在未知 Marketplace 的含 ASIN 子表: Sheet20`。
+- [x] 修复后只读映射验收：当前seq-3快照共20张表，映射18张（US=11、CA=7），`BI源数据`与`Sheet20`共2张辅助表排除；命令耗时13.578秒，未抓Amazon、未写飞书。
+- [ ] 修复后的正式批次需验证20张源表中18张价格业务表被映射、Sheet20被排除，CA结果、固定结果写入、通知和完整耗时；不以只读复现替代线上验收。
+
 ## 当前执行索引：生产级最终收口（2026-08-27）
 
 - [x] 停止新增HTML：正式诊断仅保存截图与JSON，移除位置PoC失败时的setup.html落盘；独立归档功能仍默认关闭，既有htmls和debug历史文件不删除。

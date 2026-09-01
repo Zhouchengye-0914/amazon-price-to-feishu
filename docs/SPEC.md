@@ -29,7 +29,7 @@ flowchart TD
     D -- 是 --> E{明确恢复当前run_id?}
     E -- 是 --> F[验证批次身份、缓存版本和有效期；复用本批快照和映射]
     E -- 否 --> G[每次复制最新周报；新快照添加周成业管理权限]
-    G --> H[枚举全部业务子表并审计US和CA商品链接]
+    G --> H[枚举全部业务子表；通用销售/辅助ASIN表按表头排除并留证]
     H --> I[按容量分段提取A:G；登记源指纹和latest_run身份]
     F --> J[按子表Marketplace抓取；一个浏览器最多四个商品Tab]
     I --> J
@@ -310,13 +310,13 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 | 站点/币种组合错误 | currency_error | 阻断，不换汇、不比较 |
 | 正常售价/目标价等源字段无效 | source_data_invalid | 不抓取，写异常空结果 |
 
-异常商品URL、最终页面URL、状态和原因保存在缓存/bundle；技术错误按配置保留截图及JSON诊断，不新增页面HTML。历史诊断HTML继续留存但不再增长。
+异常商品URL、最终页面URL、状态和原因保存在缓存/bundle；技术错误按配置保留截图及JSON诊断，不新增页面HTML。历史诊断HTML继续留存但不再增长。周报中名为`Sheet数字`的通用销售/导出表若只有ASIN、MSKU、销量等字段而缺少“正常售价”和“目标成交价”，按辅助表排除；未知命名且具价格业务表头的ASIN表仍阻断并要求人工确认，防止新业务子表被静默漏掉。
 
 ## 18. 当前CLI、产物与故障处理
 
 ### 18.1 正式入口
 
-启动中心选项3为PD03单条dry-run，选项4为weekly-run --confirm全量；未指定流程及旧--push-only拒绝执行，避免误入旧六列写入。工作日07:30/15:30的Windows任务继续使用原scheduled_run入口，无需重新注册。
+启动中心选项3为PD03单条dry-run，选项4为weekly-run --confirm全量；未指定流程及旧--push-only拒绝执行，避免误入旧六列写入。工作日07:30/15:30的Windows任务继续使用原scheduled_run入口，无需重新注册；直接调用`scheduled_run.bat`或HTML维护BAT时也显式使用`-NonInteractive -WindowStyle Hidden`，避免PowerShell终端被用户误关。手工启动中心仍可见，便于交互选择。
 
 以下从项目根目录运行：
 

@@ -16,6 +16,10 @@ class TestWeeklyMapping(unittest.TestCase):
         self.assertEqual(classify_sheet('PD17', False, False)[0], 'US')
         self.assertEqual(classify_sheet('BI源数据', True, True)[0], 'excluded')
         self.assertEqual(classify_sheet('Mystery', True)[0], 'unknown')
+        self.assertEqual(classify_sheet(
+            'Sheet20', True, True, ['父ASIN', 'ASIN', 'MSKU', '销量'])[0], 'excluded')
+        self.assertEqual(classify_sheet(
+            'Sheet20', True, True, ['ASIN', '正常售价', '目标成交价'])[0], 'unknown')
 
     def test_discovery_maps_business_and_excludes_auxiliary(self):
         fc = Mock()

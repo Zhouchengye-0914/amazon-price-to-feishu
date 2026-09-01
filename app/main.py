@@ -1622,6 +1622,10 @@ def _main_unlocked():
         else:
             raise RuntimeError('请显式使用 --weekly-run --confirm；最小验证使用 --weekly-run --dry-run --limit 1')
     except Exception as exc:
+        # Always persist the full traceback before attempting an error notification.
+        # Previously a successful manager notification could leave only one log line,
+        # making a failed new-week compatibility path impossible to diagnose.
+        logger.exception('[致命异常] %s: %s', type(exc).__name__, exc)
         formal = ((args.weekly_run and not args.dry_run and not args.fetch_only)
                   or args.weekly_push_only)
         if formal:
