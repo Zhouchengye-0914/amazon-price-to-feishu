@@ -74,7 +74,15 @@ def _prepare_price_run(fc, store, selection, registry, cfg, run_id, allow_create
     if resume and (not old or old.get('snapshot_run_id') != run_id):
         raise RuntimeError('只能恢复当前登记批次；禁止旧批次覆盖最新基础数据')
     if resume and allow_create and old.get('mapping_ready'):
-        assert_latest_run(store, old, run_id)
+        # A run can fail after its manifest/snapshot is ready but before the
+        # latest-run claim (for example during discovery).  If the current
+        # manifest explicitly carries this same snapshot_run_id, it is the
+        # recoverable batch—not an older batch—and may claim the pointer now.
+        # Any other run_id still has to pass the strict identity guard.
+        if old.get('snapshot_run_id') == run_id:
+            claim_latest_run(store, old, run_id)
+        else:
+            assert_latest_run(store, old, run_id)
     if resume and not allow_create and old.get('status') != 'ready':
         raise RuntimeError('只读模式不能续作云端快照初始化')
     if not allow_create and not resume:

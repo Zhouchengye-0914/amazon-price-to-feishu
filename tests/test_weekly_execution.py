@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -101,6 +102,27 @@ class WeeklyExecutionTest(unittest.TestCase):
                     execution.ensure_price_week(Mock(), WeeklyAssetStore(Path(root)),
                         SimpleNamespace(period_id='seq-3', source_url='url'), {}, {}, allow_create=False)
                 init.assert_not_called()
+
+    def test_resume_same_manifest_can_reclaim_pointer_after_preclaim_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = WeeklyAssetStore(Path(root))
+            data = {
+                'period_id': 'seq-3', 'status': 'ready', 'mapping_ready': True,
+                'snapshot_run_id': 'run-new', 'source': {'url': 'url'},
+                'snapshot': {'spreadsheet_token': 'snapshot'},
+                'result': {'spreadsheet_token': 'result'},
+            }
+            store.save('seq-3', data)
+            execution.atomic_json(store.root / 'fixed_result.json', {
+                'spreadsheet_token': 'result', 'url': 'fixed-url', 'period_id': 'seq-3'})
+            execution.atomic_json(store.root / 'latest_run.json', {
+                'period_id': 'seq-3', 'run_id': 'run-old',
+                'snapshot_token': 'old-snapshot', 'result_token': 'result'})
+            selection = SimpleNamespace(period_id='seq-3', source_url='url')
+            recovered = execution._prepare_price_run(
+                Mock(), store, selection, {}, {}, 'run-new', True, True)
+            self.assertEqual(recovered['snapshot_run_id'], 'run-new')
+            self.assertEqual(json.loads((store.root / 'latest_run.json').read_text())['run_id'], 'run-new')
 
     def test_automatic_new_week_staging_preserves_previous(self):
         with tempfile.TemporaryDirectory() as root:
