@@ -1,3 +1,3 @@
 @echo off
-powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0start_html_server.ps1"
+wscript.exe //B //NoLogo "%~dp0hidden_ps1.vbs" "%~dp0start_html_server.ps1"
 exit /b %errorlevel%

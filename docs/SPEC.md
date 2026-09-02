@@ -316,7 +316,7 @@ App ID为非敏感配置；真实Secret只走第3节来源。不输出完整凭�
 
 ### 18.1 正式入口
 
-启动中心选项3为PD03单条dry-run，选项4为weekly-run --confirm全量；未指定流程及旧--push-only拒绝执行，避免误入旧六列写入。工作日07:30/15:30的Windows任务继续使用原scheduled_run入口，无需重新注册；直接调用`scheduled_run.bat`或HTML维护BAT时也显式使用`-NonInteractive -WindowStyle Hidden`，避免PowerShell终端被用户误关。手工启动中心仍可见，便于交互选择。
+启动中心选项3为PD03单条dry-run，选项4为weekly-run --confirm全量；未指定流程及旧--push-only拒绝执行，避免误入旧六列写入。工作日07:30/15:30的Windows任务使用无控制台的`wscript.exe`→`bin/hidden_ps1.vbs`→隐藏PowerShell→`scheduled_run.ps1`链路；`scheduled_run.bat`和HTML维护BAT仅保留兼容入口，完全无窗口的手工调用应直接使用同一`wscript.exe`启动器。手工启动中心仍可见，便于交互选择。
 
 以下从项目根目录运行：
 
@@ -381,9 +381,9 @@ $env:PYTHONPATH='app'
 
 ### 19.2 每天两次
 
-当前Windows任务AmazonDaily_0730、AmazonDaily_1530均启用，每周一至周五分别07:30和15:30，WeeksInterval=1，EndBoundary为空，无8月31日截止。任务直接以隐藏PowerShell执行bin/scheduled_run.ps1 → app/main.py --weekly-run --confirm，不经过可见的bat/cmd窗口。
+当前Windows任务AmazonDaily_0730、AmazonDaily_1530均启用，每周一至周五分别07:30和15:30，WeeksInterval=1，EndBoundary为空，无8月31日截止。任务直接以`wscript.exe //B //NoLogo bin/hidden_ps1.vbs bin/scheduled_run.ps1`启动隐藏PowerShell，再执行`app/main.py --weekly-run --confirm`，不经过可见的bat/cmd窗口。旧版本若仍显示`Execute=cmd.exe`或`scheduled_run.bat`，必须重新运行安装脚本替换任务定义。
 
-当前账号为Interactive：需电脑开机且账号已登录；不需GPT窗口。任务Hidden=true、PowerShell WindowStyle=Hidden，用户不能因关闭控制台误停；StartWhenAvailable=true，开机或恢复后补触发错过时段，入口整批锁与IgnoreNew共同防重叠。日志使用UTF-8保存开始/结束及退出码。安装脚本bin/schedule.ps1创建这两条工作日任务；不操作HTML服务或防火墙。不要另装重复调度器。
+当前账号为Interactive：需电脑开机且账号已登录；不需GPT窗口。任务Hidden=true、Execute=wscript.exe、WScript批处理模式与PowerShell WindowStyle=Hidden共同保证不创建可见终端；用户不能因关闭控制台误停。StartWhenAvailable=true，开机或恢复后补触发错过时段，入口整批锁与IgnoreNew共同防重叠。日志使用UTF-8保存开始/结束及退出码。安装脚本bin/schedule.ps1创建这两条工作日任务；不操作HTML服务或防火墙。不要另装重复调度器。
 
 单次历史07:00任务不是长期规则；本次文档审查不删除或修改其他Windows任务。
 

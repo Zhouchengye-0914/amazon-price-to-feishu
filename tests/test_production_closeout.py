@@ -66,6 +66,17 @@ class SchedulerPolicyTests(unittest.TestCase):
         self.assertIn('$exitCode = 0', script)
         self.assertIn('$PID.log', script)
 
+    def test_scheduler_uses_gui_launcher_before_powershell(self):
+        root = Path(__file__).resolve().parents[1]
+        installer = (root / 'bin' / 'schedule.ps1').read_text(encoding='utf-8')
+        launcher = root / 'bin' / 'hidden_ps1.vbs'
+        scheduled_bat = (root / 'bin' / 'scheduled_run.bat').read_text(encoding='utf-8')
+        self.assertTrue(launcher.is_file())
+        self.assertIn("New-ScheduledTaskAction -Execute 'wscript.exe'", installer)
+        self.assertIn('hidden_ps1.vbs', installer)
+        self.assertIn('wscript.exe //B //NoLogo', scheduled_bat)
+        self.assertIn('WindowStyle Hidden', launcher.read_text(encoding='utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

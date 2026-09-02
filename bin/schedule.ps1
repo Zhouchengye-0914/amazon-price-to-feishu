@@ -7,6 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $runner = Join-Path $projectRoot 'bin\scheduled_run.ps1'
+$hiddenLauncher = Join-Path $projectRoot 'bin\hidden_ps1.vbs'
 
 if ($Action -eq '--remove') {
     & schtasks.exe /Delete /TN AmazonDaily_0730 /F
@@ -17,10 +18,11 @@ if ($Action -eq '--remove') {
 # HTML service and firewall are managed separately; price install/remove must
 # not start, stop, or grant network access for that optional service.
 # Current production schedule: weekdays at 07:30 and 15:30, no expiration.
-# PowerShell is launched hidden directly, so no cmd/console window can be closed
-# accidentally while the browser runs headless in the background.
-$taskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runner)
+# Use the GUI-subsystem WScript launcher.  A task that calls a .bat/cmd wrapper
+# can still flash a console before the inner PowerShell -WindowStyle Hidden is
+# applied; wscript.exe avoids creating that console in the first place.
+$taskAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument (
+    '//B //NoLogo "{0}" "{1}"' -f $hiddenLauncher, $runner)
 $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 foreach ($item in @(@('AmazonDaily_0730', 7, 30), @('AmazonDaily_1530', 15, 30))) {

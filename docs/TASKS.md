@@ -1,5 +1,13 @@
 # TASKS: Amazon Daily
 
+## 当前执行索引：无控制台调度修复（2026-09-02）
+
+- [x] 定位终端闪现原因：PowerShell的`-WindowStyle Hidden`只能隐藏内层PowerShell；若旧计划任务或人工入口先经过`cmd.exe`/BAT，外层控制台仍可能出现。
+- [x] 新增`bin/hidden_ps1.vbs`，使用GUI子系统`wscript.exe //B //NoLogo`启动隐藏、非交互PowerShell并等待原始退出码；`scheduled_run.bat`和`start_html_server.bat`同步改用该启动器（BAT被手工双击时外层cmd仍可能短暂闪现，计划任务不再经过BAT）。
+- [x] 更新`bin/schedule.ps1`：新安装的`AmazonDaily_0730/1530`直接执行`wscript.exe`，不再经过可见BAT/cmd窗口；PowerShell和Python仍保持原日志、锁和退出码链路。
+- [x] 验证：`schedule.ps1`、`scheduled_run.ps1` PowerShell语法通过，`git diff --check`通过；当前沙箱禁止CScript执行（Access denied），因此未将本机WScript运行视为已验收。
+- [x] 用户Windows主机已重新运行`bin\\schedule.bat --install`并只读回查：`AmazonDaily_0730`与`AmazonDaily_1530`均为`Ready`、`Hidden=True`、`Execute=wscript.exe`，参数指向`hidden_ps1.vbs`→`scheduled_run.ps1`；07:30最近一次退出码0，15:30下次按计划运行。旧的BAT/cmd任务定义已被替换。
+
 ## 当前执行索引：9月1日兼容性修复（2026-09-01）
 
 - [x] 复现并定位今日失败：新周报新增`Sheet20`销售/导出辅助表，因含ASIN但无价格业务表头被旧规则误判为未知Marketplace，导致快照完成后在映射阶段退出；新增通用辅助表识别，仅当缺少“正常售价/目标成交价”时排除，具备价格表头的未知命名仍阻断。
